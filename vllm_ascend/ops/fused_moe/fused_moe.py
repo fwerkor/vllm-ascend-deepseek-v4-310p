@@ -33,6 +33,7 @@ from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
+    is_310p,
     npu_stream_switch,
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
@@ -260,32 +261,87 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 # Execute the gate projection and activation concurrently with the
                 # dispatch communication.
                 maybe_wait_event(fused_moe_evts.after_routed_experts)
-                hidden_states = torch_npu.npu_quant_matmul(
-                    quantized_x,
-                    self._shared_experts.gate_up_proj.weight,
-                    self._shared_experts.gate_up_proj.weight_scale,
-                    pertoken_scale=None,
-                    bias=None,
-                    output_dtype=torch.int32,
-                )
-                # Execute activation concurrently with gmm2.
+                if is_310p():
+                    from vllm_ascend._310p.deepseek_v4 import (
+                        is_dsv4_310p_enabled,
+                    )
 
-                maybe_wait_event(fused_moe_evts.before_gmm2)
-                quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
-                    x=hidden_states,
-                    weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
-                    activation_scale=pertoken_scale,
-                    bias=None,
-                    quant_scale=None,
-                    quant_offset=None,
-                    group_index=None,
-                    activate_left=True,
-                    quant_mode=1,
-                    swiglu_mode=1,
-                    clamp_limit=fused_moe_evts.swiglu_limit,
-                    glu_alpha=fused_moe_evts.swiglu_alpha,
-                    glu_bias=fused_moe_evts.swiglu_beta,
-                )
+                    if is_dsv4_310p_enabled():
+                        # 310P WeightNZ QuantMatmul does not support INT32
+                        # output. Produce FP16 directly, then compose the
+                        # activation and dynamic quantization from supported
+                        # operators.
+                        hidden_states = torch_npu.npu_quant_matmul(
+                            quantized_x,
+                            self._shared_experts.gate_up_proj.weight,
+                            self._shared_experts.gate_up_proj.weight_scale,
+                            pertoken_scale=pertoken_scale,
+                            bias=None,
+                            output_dtype=original_dtype,
+                        )
+                        maybe_wait_event(fused_moe_evts.before_gmm2)
+                        from vllm_ascend._310p.ops.swiglu_quant import (
+                            swiglu_quant_310p,
+                        )
+
+                        quantized_x, swiglu_out_scale = swiglu_quant_310p(
+                            hidden_states,
+                            clamp_limit=fused_moe_evts.swiglu_limit,
+                            glu_alpha=fused_moe_evts.swiglu_alpha,
+                            glu_bias=fused_moe_evts.swiglu_beta,
+                        )
+                    else:
+                        hidden_states = torch_npu.npu_quant_matmul(
+                            quantized_x,
+                            self._shared_experts.gate_up_proj.weight,
+                            self._shared_experts.gate_up_proj.weight_scale,
+                            pertoken_scale=None,
+                            bias=None,
+                            output_dtype=torch.int32,
+                        )
+                        maybe_wait_event(fused_moe_evts.before_gmm2)
+                        quantized_x, swiglu_out_scale = (
+                            torch.ops._C_ascend.npu_dequant_swiglu_quant(
+                                x=hidden_states,
+                                weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
+                                activation_scale=pertoken_scale,
+                                bias=None,
+                                quant_scale=None,
+                                quant_offset=None,
+                                group_index=None,
+                                activate_left=True,
+                                quant_mode=1,
+                                swiglu_mode=1,
+                                clamp_limit=fused_moe_evts.swiglu_limit,
+                                glu_alpha=fused_moe_evts.swiglu_alpha,
+                                glu_bias=fused_moe_evts.swiglu_beta,
+                            )
+                        )
+                else:
+                    hidden_states = torch_npu.npu_quant_matmul(
+                        quantized_x,
+                        self._shared_experts.gate_up_proj.weight,
+                        self._shared_experts.gate_up_proj.weight_scale,
+                        pertoken_scale=None,
+                        bias=None,
+                        output_dtype=torch.int32,
+                    )
+                    maybe_wait_event(fused_moe_evts.before_gmm2)
+                    quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
+                        x=hidden_states,
+                        weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
+                        activation_scale=pertoken_scale,
+                        bias=None,
+                        quant_scale=None,
+                        quant_offset=None,
+                        group_index=None,
+                        activate_left=True,
+                        quant_mode=1,
+                        swiglu_mode=1,
+                        clamp_limit=fused_moe_evts.swiglu_limit,
+                        glu_alpha=fused_moe_evts.swiglu_alpha,
+                        glu_bias=fused_moe_evts.swiglu_beta,
+                    )
                 # Execute the down projection concurrently with the combine
                 # communication.
                 maybe_wait_event(fused_moe_evts.before_combine)

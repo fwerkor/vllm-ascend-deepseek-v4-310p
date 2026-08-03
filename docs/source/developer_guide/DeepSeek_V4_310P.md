@@ -27,6 +27,9 @@ The initial implementation provides:
   the expert dimension required by the 310P quantized grouped-matmul kernel.
 - software E4M3FN decoding and block-FP8 to per-row INT8 conversion for all
   DeepSeek V4 dense and shared-expert linear layers.
+- a 310P-compatible shared-expert path that emits FP16 gate/up activations,
+  then composes clamped SwiGLU and dynamic INT8 quantization. This avoids the
+  unsupported INT32 output mode of WeightNZ QuantMatmul.
 
 Remaining execution blockers are tracked in this order:
 
