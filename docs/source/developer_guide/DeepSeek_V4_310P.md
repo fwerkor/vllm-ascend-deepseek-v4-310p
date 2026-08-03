@@ -21,6 +21,8 @@ The initial implementation provides:
   per-row W8A8;
 - an optional eager diagnostic mode, selected with
   `VLLM_ASCEND_DSV4_310P_EXPERT_MODE=eager_w8a8`.
+- composed Hyper-Connection pre/Sinkhorn/post fallbacks based on the official
+  DeepSeek V4 reference formulas.
 
 Remaining execution blockers are tracked in this order:
 

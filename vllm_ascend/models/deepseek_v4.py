@@ -89,6 +89,7 @@ from vllm_ascend.utils import (
     extract_dsv4_layer_index,
     get_ascend_device_type,
     get_dsv4_compress_ratio,
+    is_310p,
 )
 
 
@@ -970,12 +971,33 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
+        if is_310p():
+            from vllm_ascend._310p.deepseek_v4 import is_dsv4_310p_enabled
+            from vllm_ascend._310p.ops.hyper_connection import hc_pre_310p
+
+            if is_dsv4_310p_enabled():
+                return hc_pre_310p(
+                    x,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    self.hc_mult,
+                    self.hc_sinkhorn_iters,
+                    self.norm_eps,
+                    self.hc_eps,
+                )
         y = torch.ops._C_ascend.npu_hc_pre_v2(
             x, hc_fn, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.norm_eps, self.hc_eps
         )
         return y
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        if is_310p():
+            from vllm_ascend._310p.deepseek_v4 import is_dsv4_310p_enabled
+            from vllm_ascend._310p.ops.hyper_connection import hc_post_310p
+
+            if is_dsv4_310p_enabled():
+                return hc_post_310p(x, residual, post, comb)
         y = torch.ops._C_ascend.npu_hc_post(
             x.unsqueeze(dim=0), residual.unsqueeze(dim=0), post.unsqueeze(dim=0), comb.unsqueeze(dim=0)
         )
