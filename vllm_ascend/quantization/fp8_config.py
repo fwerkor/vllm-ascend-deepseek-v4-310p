@@ -8,7 +8,8 @@ from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS, register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
 
-from vllm_ascend.utils import FP8_METHOD
+from vllm_ascend._310p.deepseek_v4 import is_dsv4_310p_enabled
+from vllm_ascend.utils import FP8_METHOD, is_310p
 
 from .methods import get_scheme_class
 
@@ -120,6 +121,16 @@ class AscendFp8Config(QuantizationConfig):
             return quant_method
         if _is_fused_moe_layer(layer):
             layer.ascend_quant_method = FP8_METHOD
+            if is_310p() and is_dsv4_310p_enabled():
+                from vllm_ascend._310p.quantization.methods.w4a8_mxfp4 import (
+                    AscendMXFP4ToW8A8DynamicFusedMoEMethod310,
+                )
+
+                scheme = AscendMXFP4ToW8A8DynamicFusedMoEMethod310(
+                    self.quant_description,
+                    tid2eid=tid2eid,
+                )
+                return AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid=tid2eid)
             scheme = create_scheme_for_layer(self.quant_description, prefix, "w4a8_moe", self.packed_modules_mapping)
             quant_method = AscendFusedMoEMethod(scheme, layer.moe_config, tid2eid=tid2eid)
             return quant_method
