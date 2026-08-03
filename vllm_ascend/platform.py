@@ -33,6 +33,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_ascend._310p.deepseek_v4 import get_dsv4_310p_backend
 from vllm_ascend.ascend_config import init_ascend_config
 
 # isort: off
@@ -817,6 +818,17 @@ class NPUPlatform(Platform):
         }
 
         if is_310p():
+            experimental_dsv4_backend = get_dsv4_310p_backend(
+                use_mla=attn_selector_config.use_mla,
+                use_sparse=attn_selector_config.use_sparse,
+                use_compress=use_compress,
+            )
+            if experimental_dsv4_backend is not None:
+                logger.warning_once(
+                    "The experimental DeepSeek V4 backend for Ascend 310P is enabled: %s",
+                    experimental_dsv4_backend,
+                )
+                return experimental_dsv4_backend
             return backend_map_310.get(key, backend_map_310[(False, False)])
 
         return backend_map[(attn_selector_config.use_mla, attn_selector_config.use_sparse, use_compress)]

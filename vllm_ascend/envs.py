@@ -100,6 +100,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Experimental DeepSeek V4 backend for Ascend 310P. This is deliberately
+    # opt-in until the 310P MLA/DSA execution path reaches feature parity.
+    "VLLM_ASCEND_ENABLE_DSV4_310P": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DSV4_310P", "0"))),
 }
 
 # end-env-vars-definition

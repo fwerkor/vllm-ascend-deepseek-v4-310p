@@ -44,6 +44,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
+from vllm_ascend._310p.deepseek_v4 import is_deepseek_v4_model, is_dsv4_310p_enabled
 from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
 from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
 from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
@@ -702,6 +703,12 @@ class NPUModelRunner310(NPUModelRunner):
         if self.vllm_config.kv_transfer_config is not None:
             logger.error("KV cache transfer is not supported.")
             raise ValueError("KV cache transfer is not supported for 310P.")
+        if is_dsv4_310p_enabled() and is_deepseek_v4_model(self.model_config):
+            logger.warning_once(
+                "Initializing DeepSeek V4 KV caches through the experimental 310P path. "
+                "This reuses the shared Ascend MLA/DSA cache layout."
+            )
+            return super().initialize_kv_cache_tensors(kv_cache_config)
         if self.use_sparse:
             logger.error("Deepseek Sparse Attention is not supported.")
             raise ValueError("Deepseek Sparse Attention is not supported for 310P.")
