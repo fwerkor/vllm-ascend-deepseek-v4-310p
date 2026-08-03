@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend._310p.quantization.methods.mxfp4_to_w8a8 import requantize_mxfp4_to_int8
 from vllm_ascend._310p.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod310
@@ -75,6 +76,13 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
         }
 
     def process_weights_after_loading(self, layer) -> None:
+        logger.info_once(
+            "Converting local DeepSeek V4 MXFP4 expert shard to 310P W8A8: "
+            "w13=%s, w2=%s, experts=%d.",
+            tuple(layer.w13_weight.shape),
+            tuple(layer.w2_weight.shape),
+            layer.w13_weight.shape[0],
+        )
         w13_weight, w13_scale = requantize_mxfp4_to_int8(layer.w13_weight.data, layer.w13_weight_scale.data)
         w2_weight, w2_scale = requantize_mxfp4_to_int8(layer.w2_weight.data, layer.w2_weight_scale.data)
 
