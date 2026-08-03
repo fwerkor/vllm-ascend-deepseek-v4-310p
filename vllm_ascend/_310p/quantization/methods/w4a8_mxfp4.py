@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -21,6 +23,9 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
     """
 
     group_size = 32
+    _MODE_ENV = "VLLM_ASCEND_DSV4_310P_EXPERT_MODE"
+    _STREAMING_MODE = "streaming_w8a8"
+    _EAGER_MODE = "eager_w8a8"
 
     def __init__(self, quant_config: dict[str, Any], tid2eid=None):
         super().__init__()
@@ -30,6 +35,12 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
                 f"DeepSeek V4 MXFP4 on 310P requires group_size={self.group_size}, got {configured_group_size}."
             )
         self.tid2eid = tid2eid
+        self.execution_mode = os.getenv(self._MODE_ENV, self._STREAMING_MODE)
+        if self.execution_mode not in (self._STREAMING_MODE, self._EAGER_MODE):
+            raise ValueError(
+                f"Unsupported {self._MODE_ENV}={self.execution_mode!r}; "
+                f"expected {self._STREAMING_MODE!r} or {self._EAGER_MODE!r}."
+            )
 
     @staticmethod
     def get_weight(
@@ -76,8 +87,18 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
         }
 
     def process_weights_after_loading(self, layer) -> None:
+        if self.execution_mode == self._STREAMING_MODE:
+            logger.info_once(
+                "Keeping local DeepSeek V4 expert shards packed for 310P streaming W8A8: "
+                "w13=%s, w2=%s, experts=%d.",
+                tuple(layer.w13_weight.shape),
+                tuple(layer.w2_weight.shape),
+                layer.w13_weight.shape[0],
+            )
+            return
+
         logger.info_once(
-            "Converting local DeepSeek V4 MXFP4 expert shard to 310P W8A8: "
+            "Eagerly converting local DeepSeek V4 MXFP4 expert shard to 310P W8A8: "
             "w13=%s, w2=%s, experts=%d.",
             tuple(layer.w13_weight.shape),
             tuple(layer.w2_weight.shape),
@@ -90,3 +111,23 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
         layer.w2_weight.data = maybe_trans_nz(w2_weight)
         layer.w13_weight_scale.data = w13_scale.view(w13_scale.shape[0], -1)
         layer.w2_weight_scale.data = w2_scale.view(w2_scale.shape[0], -1)
+
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        if self.execution_mode == self._EAGER_MODE:
+            return super().apply(layer, *args, **kwargs)
+
+        # Materialize one layer at a time. The NPU caching allocator reuses the
+        # temporary buffers across decoder layers, keeping peak memory bounded
+        # while the checkpoint remains in its compact packed representation.
+        w13_weight, w13_scale = requantize_mxfp4_to_int8(layer.w13_weight.data, layer.w13_weight_scale.data)
+        w2_weight, w2_scale = requantize_mxfp4_to_int8(layer.w2_weight.data, layer.w2_weight_scale.data)
+
+        materialized_layer = SimpleNamespace(
+            w13_weight=maybe_trans_nz(w13_weight),
+            w2_weight=maybe_trans_nz(w2_weight),
+            w13_weight_scale=w13_scale.view(w13_scale.shape[0], -1),
+            w2_weight_scale=w2_scale.view(w2_scale.shape[0], -1),
+            zero_expert_num=getattr(layer, "zero_expert_num", 0),
+            zero_expert_type=getattr(layer, "zero_expert_type", None),
+        )
+        return super().apply(materialized_layer, *args, **kwargs)
