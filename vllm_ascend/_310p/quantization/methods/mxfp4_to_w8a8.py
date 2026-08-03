@@ -106,12 +106,16 @@ def requantize_mxfp4_to_int8(
 
     packed_rows = packed_weight.reshape(num_rows, groups, MXFP4_GROUP_SIZE // MXFP4_VALUES_PER_BYTE)
     scale_rows = e8m0_scale.reshape(num_rows, groups)
+    logical_shape = (*leading_shape, groups * MXFP4_GROUP_SIZE)
+    scale_shape = (*leading_shape, 1)
     quantized = torch.empty(
-        (num_rows, groups * MXFP4_GROUP_SIZE),
+        logical_shape,
         dtype=torch.int8,
         device=packed_weight.device,
     )
-    row_scales = torch.empty((num_rows, 1), dtype=torch.float32, device=packed_weight.device)
+    row_scales = torch.empty(scale_shape, dtype=torch.float32, device=packed_weight.device)
+    quantized_rows = quantized.reshape(num_rows, groups * MXFP4_GROUP_SIZE)
+    row_scale_rows = row_scales.reshape(num_rows, 1)
 
     for start in range(0, num_rows, rows_per_chunk):
         end = min(start + rows_per_chunk, num_rows)
@@ -124,9 +128,7 @@ def requantize_mxfp4_to_int8(
         safe_scale = torch.where(scale > 0, scale, torch.ones_like(scale))
         qweight = torch.round(dequantized / safe_scale).clamp_(-127, 127).to(torch.int8)
 
-        quantized[start:end].copy_(qweight)
-        row_scales[start:end].copy_(safe_scale)
+        quantized_rows[start:end].copy_(qweight)
+        row_scale_rows[start:end].copy_(safe_scale)
 
-    logical_shape = (*leading_shape, groups * MXFP4_GROUP_SIZE)
-    scale_shape = (*leading_shape, 1)
-    return quantized.reshape(logical_shape), row_scales.reshape(scale_shape)
+    return quantized, row_scales

@@ -23,6 +23,10 @@ The initial implementation provides:
   `VLLM_ASCEND_DSV4_310P_EXPERT_MODE=eager_w8a8`.
 - composed Hyper-Connection pre/Sinkhorn/post fallbacks based on the official
   DeepSeek V4 reference formulas.
+- logical-shape-preserving W8A8 allocation so FRACTAL_NZ conversion retains
+  the expert dimension required by the 310P quantized grouped-matmul kernel.
+- software E4M3FN decoding and block-FP8 to per-row INT8 conversion for all
+  DeepSeek V4 dense and shared-expert linear layers.
 
 Remaining execution blockers are tracked in this order:
 

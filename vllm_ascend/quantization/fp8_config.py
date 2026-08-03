@@ -116,6 +116,14 @@ class AscendFp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             layer.ascend_quant_method = FP8_METHOD
 
+            if is_310p() and is_dsv4_310p_enabled():
+                from vllm_ascend._310p.quantization.methods.fp8_to_w8a8 import (
+                    AscendFP8ToW8A8DynamicLinearMethod310,
+                )
+
+                scheme = AscendFP8ToW8A8DynamicLinearMethod310(self.quant_description)
+                return AscendLinearMethod(scheme)
+
             scheme = create_scheme_for_layer(self.quant_description, prefix, "ds_linear", self.packed_modules_mapping)
             quant_method = AscendLinearMethod(scheme)
             return quant_method

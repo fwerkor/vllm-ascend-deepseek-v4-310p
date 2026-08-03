@@ -53,3 +53,17 @@ def test_requantize_chunking_is_stable() -> None:
     q2, s2 = requantize_mxfp4_to_int8(packed, scales, rows_per_chunk=64)
     torch.testing.assert_close(q1, q2)
     torch.testing.assert_close(s1, s2)
+
+
+def test_requantize_allocates_the_final_logical_shape() -> None:
+    packed = torch.zeros((2, 3, 16), dtype=torch.uint8)
+    scales = torch.full((2, 3, 1), 127, dtype=torch.uint8)
+    qweight, row_scale = requantize_mxfp4_to_int8(packed, scales)
+
+    assert qweight.shape == (2, 3, 32)
+    assert row_scale.shape == (2, 3, 1)
+    # A view of a flattened allocation would retain a 2D storage descriptor
+    # on Ascend. Allocating the final shape directly is required before NZ
+    # conversion for grouped matmul.
+    assert qweight._base is None
+    assert row_scale._base is None
