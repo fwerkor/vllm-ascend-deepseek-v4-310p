@@ -6,7 +6,6 @@ from unittest.mock import patch
 from vllm_ascend._310p.deepseek_v4 import (
     DSA_BACKEND_310P,
     DSV4_310P_ENV,
-    MLA_BACKEND_310P,
     get_dsv4_310p_backend,
     is_deepseek_v4_model,
     is_dsv4_310p_enabled,
@@ -24,9 +23,9 @@ def test_dsv4_310p_selects_dsa_for_compressed_mla() -> None:
         assert get_dsv4_310p_backend(use_mla=True, use_sparse=False, use_compress=True) == DSA_BACKEND_310P
 
 
-def test_dsv4_310p_selects_plain_mla_without_compression() -> None:
+def test_dsv4_310p_selects_dsa_without_global_compression_flag() -> None:
     with patch.dict("os.environ", {DSV4_310P_ENV: "1"}, clear=True):
-        assert get_dsv4_310p_backend(use_mla=True, use_sparse=False, use_compress=False) == MLA_BACKEND_310P
+        assert get_dsv4_310p_backend(use_mla=True, use_sparse=False, use_compress=False) == DSA_BACKEND_310P
 
 
 def test_dsv4_310p_does_not_override_sfa_or_dense_attention() -> None:

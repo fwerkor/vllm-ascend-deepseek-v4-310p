@@ -24,14 +24,15 @@ def get_dsv4_310p_backend(
 ) -> str | None:
     """Return a dedicated 310P backend path for MLA/DSA configurations.
 
-    DeepSeek V4 uses the compressed DSA path represented by
-    ``use_mla=True, use_sparse=False, use_compress=True``. Plain MLA is kept as
-    a separate extension point because both paths need different metadata and
-    KV-cache handling.
+    DeepSeek V4 always constructs ``DSAAttention``. Its compression ratio is a
+    per-layer value (1, 4, or 128), so the global attention selector's
+    ``use_compress`` flag is not sufficient to distinguish its layers. When the
+    model-specific feature gate is enabled, every MLA-selector request is
+    therefore routed to the DSA backend; that backend handles all ratios.
     """
     if not is_dsv4_310p_enabled() or not use_mla or use_sparse:
         return None
-    return DSA_BACKEND_310P if use_compress else MLA_BACKEND_310P
+    return DSA_BACKEND_310P
 
 
 def is_deepseek_v4_model(model_config) -> bool:

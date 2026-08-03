@@ -12,7 +12,8 @@ export VLLM_ASCEND_ENABLE_DSV4_310P=1
 The initial implementation provides:
 
 - dedicated 310P MLA and DSA backend classes;
-- correct 310P attention backend routing for compressed MLA/DSA;
+- model-specific routing of every DeepSeek V4 layer to the DSA backend, which
+  handles the per-layer compression ratios 1, 4, and 128;
 - reuse of the shared DeepSeek V4 KV-cache allocator and binding logic;
 - compatibility with the 310P AllGather expert-parallel path in current main.
 - loading-time conversion of each local EP expert shard from packed MXFP4 to
