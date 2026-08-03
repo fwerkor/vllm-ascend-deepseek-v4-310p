@@ -738,6 +738,15 @@ class NPUModelRunner310(NPUModelRunner):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer.
         """
+        if is_dsv4_310p_enabled() and is_deepseek_v4_model(self.model_config):
+            # The generic Ascend allocator already understands
+            # AscendMLAAttentionSpec and splits DeepSeek MLA cache pages into
+            # the compressed latent K cache and RoPE cache.  Calling the base
+            # implementation explicitly avoids dispatching back into this
+            # 310P AttentionSpec-only allocator from
+            # NPUModelRunner.initialize_kv_cache_tensors().
+            return NPUModelRunner._allocate_kv_cache_tensors(self, kv_cache_config)
+
         # init kv cache tensors
         kv_cache: dict[str, list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]] = {}
         # get kv cache spec for each layer
