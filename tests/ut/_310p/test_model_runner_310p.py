@@ -172,3 +172,15 @@ class TestNPUModelRunner310(TestBase):
         self.assertEqual(kwargs["max_num_blocks_per_req"], [4, 6])
         self.assertIs(kwargs["kv_cache_groups"], kv_cache_config.kv_cache_groups)
         self.assertEqual(kwargs["cp_kv_cache_interleave_size"], 4)
+
+
+def test_prepare_inputs_passes_group_compressed_positions_to_slot_mapping():
+    import inspect
+
+    from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+
+    source = inspect.getsource(NPUModelRunner310._prepare_inputs)
+    assert "get_compressed_pos_and_indices(" in source
+    assert "self.kv_cache_config.kv_cache_groups" in source
+    assert "positions_compressed_list=positions_compressed_list" in source
+    assert "req_indices_compressed_list=req_indices_compressed_list" in source

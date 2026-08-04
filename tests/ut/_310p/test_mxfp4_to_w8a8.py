@@ -16,21 +16,19 @@ def test_decode_e8m0_exact_powers_of_two() -> None:
     torch.testing.assert_close(decoded, expected, rtol=0, atol=0)
 
 
-def test_unpack_mxfp4_uses_low_then_high_nibbles() -> None:
+def test_unpack_mxfp4_preserves_per_byte_nibble_order() -> None:
     low_codes = torch.arange(16, dtype=torch.uint8)
     high_codes = torch.arange(15, -1, -1, dtype=torch.uint8)
     packed = (low_codes | (high_codes << 4)).reshape(1, 1, 16)
     unpacked = unpack_mxfp4_groups(packed).reshape(-1)
-    table = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-    )
-    torch.testing.assert_close(unpacked[:16], table)
-    torch.testing.assert_close(unpacked[16:], table.flip(0))
+    table = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
+    expected = torch.stack((table, table.flip(0)), dim=-1).flatten()
+    torch.testing.assert_close(unpacked, expected)
 
 
 def test_requantize_mxfp4_to_int8_preserves_shape_and_relative_values() -> None:
-    # Low nibbles are codes 0..15; high nibbles are the same codes. E8M0=127
-    # gives a group scale of one.
+    # Each byte stores two consecutive values. Low and high nibbles use the
+    # same code here, and E8M0=127 gives a group scale of one.
     codes = torch.arange(16, dtype=torch.uint8)
     packed = (codes | (codes << 4)).reshape(1, 1, 16)
     scales = torch.tensor([[[127]]], dtype=torch.uint8)
@@ -40,9 +38,11 @@ def test_requantize_mxfp4_to_int8_preserves_shape_and_relative_values() -> None:
     assert qweight.shape == (1, 1, 32)
     assert row_scale.shape == (1, 1, 1)
     torch.testing.assert_close(row_scale, torch.tensor([[[6.0 / 127.0]]]))
-    assert qweight[0, 0, 7].item() == 127
-    assert qweight[0, 0, 15].item() == -127
-    torch.testing.assert_close(qweight[..., :16], qweight[..., 16:])
+    assert qweight[0, 0, 14].item() == 127
+    assert qweight[0, 0, 15].item() == 127
+    assert qweight[0, 0, 30].item() == -127
+    assert qweight[0, 0, 31].item() == -127
+    torch.testing.assert_close(qweight[..., 0::2], qweight[..., 1::2])
 
 
 def test_requantize_chunking_is_stable() -> None:

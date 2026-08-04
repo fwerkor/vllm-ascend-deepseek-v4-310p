@@ -200,6 +200,7 @@ class NPUPlatform(Platform):
             from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendFp8Config, AscendModelSlimConfig  # noqa: F401
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
+
             # DeepSeek V4 checkpoints use the ``deepseek_v4_fp8`` quantization
             # name. Import the Ascend override on 310P as well; otherwise vLLM
             # keeps its GPU ScaledMM config and fails before model construction.

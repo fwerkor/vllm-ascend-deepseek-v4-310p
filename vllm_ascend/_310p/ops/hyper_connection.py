@@ -24,15 +24,11 @@ def hc_split_sinkhorn_310p(
     """Split HC logits and apply the reference Sinkhorn normalization."""
     expected_width = (2 + hc_mult) * hc_mult
     if mixes.shape[-1] != expected_width:
-        raise ValueError(
-            f"Expected HC mix width {expected_width}, got {mixes.shape[-1]}."
-        )
+        raise ValueError(f"Expected HC mix width {expected_width}, got {mixes.shape[-1]}.")
     if hc_scale.numel() != 3:
         raise ValueError(f"Expected three HC scales, got {hc_scale.numel()}.")
     if hc_base.numel() != expected_width:
-        raise ValueError(
-            f"Expected HC base width {expected_width}, got {hc_base.numel()}."
-        )
+        raise ValueError(f"Expected HC base width {expected_width}, got {hc_base.numel()}.")
     if sinkhorn_iters < 1:
         raise ValueError("sinkhorn_iters must be at least one.")
 
@@ -41,12 +37,8 @@ def hc_split_sinkhorn_310p(
     comb_logits = mixes[..., 2 * hc_mult :].unflatten(-1, (hc_mult, hc_mult))
 
     pre = torch.sigmoid(pre_logits * hc_scale[0] + hc_base[:hc_mult]) + eps
-    post = 2.0 * torch.sigmoid(
-        post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
-    )
-    comb = comb_logits * hc_scale[2] + hc_base[2 * hc_mult :].view(
-        hc_mult, hc_mult
-    )
+    post = 2.0 * torch.sigmoid(post_logits * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult])
+    comb = comb_logits * hc_scale[2] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
 
     # Reference order: row softmax + eps, column normalization, then
     # alternating row/column normalizations for the remaining iterations.
@@ -73,9 +65,7 @@ def hc_pre_310p(
     if x.ndim not in (3, 4):
         raise ValueError(f"HC pre expects a 3D or 4D tensor, got {x.ndim}D.")
     if x.shape[-2] != hc_mult:
-        raise ValueError(
-            f"HC dimension must equal hc_mult={hc_mult}, got {x.shape[-2]}."
-        )
+        raise ValueError(f"HC dimension must equal hc_mult={hc_mult}, got {x.shape[-2]}.")
 
     original_dtype = x.dtype
     x_float = x.float()
@@ -102,14 +92,9 @@ def hc_post_310p(
 ) -> torch.Tensor:
     """Expand one hidden state back to HC copies using learned mixing."""
     if residual.shape[-2] != post.shape[-1]:
-        raise ValueError(
-            "Residual HC dimension and post width differ: "
-            f"{residual.shape[-2]} vs {post.shape[-1]}."
-        )
+        raise ValueError(f"Residual HC dimension and post width differ: {residual.shape[-2]} vs {post.shape[-1]}.")
     if comb.shape[-2:] != (post.shape[-1], post.shape[-1]):
-        raise ValueError(
-            f"Expected square HC comb matrix, got {tuple(comb.shape[-2:])}."
-        )
+        raise ValueError(f"Expected square HC comb matrix, got {tuple(comb.shape[-2:])}.")
 
     output = post.unsqueeze(-1) * x.unsqueeze(-2)
     output = output + torch.sum(

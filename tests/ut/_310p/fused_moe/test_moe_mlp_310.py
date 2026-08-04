@@ -119,9 +119,17 @@ class TestUnifiedApplyMLP310(TestBase):
 
     @patch("torch.cumsum")
     @patch("torch_npu.npu_quant_grouped_matmul_dequant", create=True)
-    @patch("torch_npu.npu_swiglu")
+    @patch("vllm_ascend._310p.fused_moe.moe_mlp.clipped_swiglu_310p")
+    @patch(
+        "vllm_ascend._310p.fused_moe.moe_mlp.zero_inactive_grouped_matmul_rows",
+        side_effect=lambda tensor, _group_list: tensor,
+    )
     def test_unified_apply_mlp_with_quantization_310(
-        self, mock_npu_swiglu, mock_npu_quant_grouped_matmul_dequant, mock_cumsum
+        self,
+        mock_zero_inactive_rows,
+        mock_clipped_swiglu,
+        mock_npu_quant_grouped_matmul_dequant,
+        mock_cumsum,
     ):
         mock_cumsum_out = torch.arange(0, 10, dtype=torch.int64)
         mock_cumsum.return_value = mock_cumsum_out
@@ -129,8 +137,8 @@ class TestUnifiedApplyMLP310(TestBase):
         mock_gmm2_out = torch.randn(10, 20, dtype=torch.float16)
         mock_npu_quant_grouped_matmul_dequant.side_effect = [mock_gmm1_out, mock_gmm2_out]
 
-        mock_npu_swiglu_output = torch.randn(10, 40, dtype=torch.float16)
-        mock_npu_swiglu.return_value = mock_npu_swiglu_output
+        mock_swiglu_output = torch.randn(10, 20, dtype=torch.float16)
+        mock_clipped_swiglu.return_value = mock_swiglu_output
 
         hidden_states = torch.randn(10, 20, dtype=torch.float16)
         w1 = torch.randn(5, 20, 40, dtype=torch.float16)
@@ -153,27 +161,24 @@ class TestUnifiedApplyMLP310(TestBase):
 
         mock_cumsum.assert_called_once()
         self.assertEqual(mock_npu_quant_grouped_matmul_dequant.call_count, 2)
-        mock_npu_quant_grouped_matmul_dequant.assert_has_calls(
-            [
-                call(
-                    x=hidden_states,
-                    quantized_weight=w1,
-                    weight_scale=w1_scale,
-                    group_list=mock_cumsum_out,
-                    quant_mode="pertoken",
-                ),
-                call(
-                    x=mock_npu_swiglu_output,
-                    quantized_weight=w2,
-                    weight_scale=w2_scale,
-                    group_list=mock_cumsum_out,
-                    quant_mode="pertoken",
-                ),
-            ],
-            any_order=True,
+        first_gmm, second_gmm = mock_npu_quant_grouped_matmul_dequant.call_args_list
+        self.assertIs(first_gmm.kwargs["x"], hidden_states)
+        self.assertIs(first_gmm.kwargs["quantized_weight"], w1)
+        self.assertIs(first_gmm.kwargs["weight_scale"], w1_scale)
+        self.assertIs(first_gmm.kwargs["group_list"], mock_cumsum_out)
+        self.assertEqual(first_gmm.kwargs["quant_mode"], "pertoken")
+        self.assertIs(second_gmm.kwargs["x"], mock_swiglu_output)
+        self.assertIs(second_gmm.kwargs["quantized_weight"], w2)
+        self.assertIs(second_gmm.kwargs["weight_scale"], w2_scale)
+        self.assertIs(second_gmm.kwargs["group_list"], mock_cumsum_out)
+        self.assertEqual(second_gmm.kwargs["quant_mode"], "pertoken")
+        mock_clipped_swiglu.assert_called_once_with(
+            mock_gmm1_out,
+            limit=0.0,
+            alpha=1.0,
+            bias=0.0,
         )
-        mock_npu_swiglu.assert_called_once()
-        mock_npu_swiglu.assert_called_with(mock_gmm1_out)
+        self.assertEqual(mock_zero_inactive_rows.call_count, 2)
 
         self.assertEqual(result.shape, hidden_states.shape)
         self.assertEqual(result.dtype, torch.float16)

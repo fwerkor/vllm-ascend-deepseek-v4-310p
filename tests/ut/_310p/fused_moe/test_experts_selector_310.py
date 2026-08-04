@@ -83,3 +83,57 @@ class TestExpertsSelector310:
         assert topk_weights.shape == (num_tokens, 2)
         assert topk_ids.shape == (num_tokens, 2)
         assert torch.all(topk_weights == 0.5)
+
+    def test_hash_routing_uses_tid2eid_and_router_weights(self):
+        hidden_states = torch.zeros(3, 4, dtype=torch.float16)
+        router_logits = torch.tensor(
+            [
+                [0.0, 1.0, 2.0, 3.0],
+                [4.0, 3.0, 2.0, 1.0],
+                [-1.0, 0.0, 1.0, 2.0],
+            ],
+            dtype=torch.float32,
+        )
+        tid2eid = torch.tensor(
+            [
+                [3, 1],
+                [0, 2],
+                [1, 3],
+                [2, 0],
+            ],
+            dtype=torch.int32,
+        )
+        input_ids = torch.tensor([0, 2, 3], dtype=torch.int64)
+
+        weights, ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=2,
+            use_grouped_topk=True,
+            renormalize=True,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=1.5,
+            input_ids=input_ids,
+            tid2eid=tid2eid,
+        )
+
+        expected_ids = tid2eid[input_ids]
+        scores = torch.nn.functional.softplus(router_logits).sqrt()
+        expected_weights = scores.gather(1, expected_ids.long())
+        expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
+        expected_weights = expected_weights * 1.5
+
+        torch.testing.assert_close(ids, expected_ids)
+        torch.testing.assert_close(weights.float(), expected_weights, rtol=2e-3, atol=2e-3)
+
+
+def test_w8a8_apply_uses_instance_hash_table():
+    import inspect
+
+    from vllm_ascend._310p.quantization.methods.w8a8_dynamic import (
+        AscendW8A8DynamicFusedMoEMethod310,
+    )
+
+    source = inspect.getsource(AscendW8A8DynamicFusedMoEMethod310.apply)
+    assert 'getattr(self, "tid2eid", None)' in source
+    assert "tid2eid=routing_table" in source

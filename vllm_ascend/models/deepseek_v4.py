@@ -451,6 +451,7 @@ class DeepseekV4MoE(nn.Module):
             # DeepSeek V4: normalize top-k weights, then scale routed output.
             # AITER applies routed_scaling_factor internally.
             routed_scaling_factor=self.routed_scaling_factor,
+            swiglu_limit=self.swiglu_limit,
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
@@ -496,9 +497,16 @@ class DeepseekV4MoE(nn.Module):
                         final_hidden_states *= self.routed_scaling_factor
             elif self.shared_experts is not None:
                 assert shared_output is not None
-                final_hidden_states = muls_add_triton(
-                    shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
-                )
+                routed_experts = getattr(self.experts, "routed_experts", None)
+                quant_method = getattr(routed_experts, "quant_method", None)
+                if getattr(quant_method, "routed_output_includes_scale", False):
+                    # The 310P W8A8 selector already applies route_scale to
+                    # routed expert weights. Shared experts are unscaled.
+                    final_hidden_states = shared_output + final_hidden_states
+                else:
+                    final_hidden_states = muls_add_triton(
+                        shared_output, final_hidden_states, 1.0 / self.routed_scaling_factor
+                    )
         else:
             final_hidden_states = fused_moe_out
 
@@ -854,7 +862,16 @@ class DeepseekV4Attention(nn.Module):
                     skip_topk = pattern[indexer_seq_idx] == "S"
 
         ascend_device_type = get_ascend_device_type()
-        k_dtype = torch.float8_e4m3fn if ascend_device_type == AscendDeviceType.A5 else torch.bfloat16
+        if ascend_device_type == AscendDeviceType.A5:
+            k_dtype = torch.float8_e4m3fn
+        elif is_310p():
+            # 310P's paged/as-strided cache path does not support in-place
+            # index_copy_ on BF16 tensors.  The experimental DeepSeek V4
+            # backend already runs activations in FP16, so keep the SWA cache
+            # in FP16 as well instead of forcing the generic BF16 default.
+            k_dtype = torch.float16
+        else:
+            k_dtype = torch.bfloat16
         swa_cache_layer = AscendDeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
@@ -1254,7 +1271,10 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
-                quant_config=quant_config,
+                # DeepSeek V4 stores head.weight in BF16 without an FP8 scale.
+                # Applying the global FP8 config on 310P would allocate an
+                # uninitialized weight_scale and corrupt every output logit.
+                quant_config=None if is_310p() else quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:
@@ -1543,8 +1563,33 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                             continue
 
                         param = params_dict[name]
+                        if (
+                            is_310p()
+                            and name.endswith(".weight_scale")
+                            and loaded_weight.ndim == param.ndim
+                            and loaded_weight.shape[:-1] == param.shape[:-1]
+                            and loaded_weight.shape[-1] == param.shape[-1] * tp_size
+                        ):
+                            # Row-parallel FP8/MXFP block scales are sharded on
+                            # the input-block dimension just like their weights.
+                            # vLLM's generic loader expects these auxiliary scale
+                            # tensors to be pre-sharded for the local TP rank.
+                            shard_width = param.shape[-1]
+                            loaded_weight = loaded_weight.narrow(
+                                -1,
+                                tp_rank * shard_width,
+                                shard_width,
+                            ).contiguous()
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                        weight_loader(param, loaded_weight)
+                        try:
+                            weight_loader(param, loaded_weight)
+                        except AssertionError as exc:
+                            raise AssertionError(
+                                "DeepSeek V4 checkpoint shape mismatch while loading "
+                                f"{name}: destination={tuple(param.shape)} "
+                                f"checkpoint={tuple(loaded_weight.shape)} "
+                                f"loader={getattr(weight_loader, '__qualname__', type(weight_loader).__name__)}"
+                            ) from exc
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 

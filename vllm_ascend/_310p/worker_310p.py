@@ -14,7 +14,9 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import ctypes
 import gc
+import os
 
 import psutil
 import torch
@@ -30,14 +32,80 @@ from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
 
 
 class NPUWorker310(NPUWorker):
+    _DSV4_EXPERT_MODE_ENV = "VLLM_ASCEND_DSV4_310P_EXPERT_MODE"
+    _DSV4_EAGER_MODE = "eager_w8a8"
+
+    def _uses_eager_dsv4_experts(self) -> bool:
+        return os.getenv(self._DSV4_EXPERT_MODE_ENV) == self._DSV4_EAGER_MODE
+
+    def _set_dsv4_op_timeout(self) -> None:
+        if not self._uses_eager_dsv4_experts():
+            return
+
+        timeout = int(os.getenv("VLLM_ASCEND_DSV4_310P_OP_TIMEOUT_SECONDS", "1800"))
+        if timeout <= 0:
+            raise ValueError("DeepSeek V4 310P op timeout must be positive.")
+        ascendcl = ctypes.CDLL("libascendcl.so")
+        set_timeout = ascendcl.aclrtSetOpExecuteTimeOut
+        set_timeout.argtypes = [ctypes.c_uint32]
+        set_timeout.restype = ctypes.c_int
+        result = int(set_timeout(timeout))
+        if result != 0:
+            raise RuntimeError(f"aclrtSetOpExecuteTimeOut({timeout}) failed with error {result}.")
+        logger.info_once(
+            "Set Ascend op execution timeout to %d seconds for DeepSeek V4 eager conversion.",
+            timeout,
+            scope="local",
+        )
+
+    def _prewarm_dsv4_hccl_groups(self) -> None:
+        """Initialize lazy HCCL communicators before eager experts fill HBM."""
+        if not self._uses_eager_dsv4_experts():
+            return
+
+        from vllm.distributed import get_ep_group, get_tp_group
+
+        probe = torch.zeros(1, dtype=torch.float16, device=self.device)
+        warmed: set[str] = set()
+        for name, group in (("tp", get_tp_group()), ("ep", get_ep_group())):
+            unique_name = getattr(group, "unique_name", name)
+            if unique_name in warmed or group.world_size <= 1:
+                continue
+            group.all_reduce(probe)
+            warmed.add(unique_name)
+        torch.npu.synchronize()
+        logger.info_once(
+            "Preinitialized TP/EP HCCL communicators before eager DeepSeek V4 expert conversion.",
+            scope="local",
+        )
+
     def init_device(self):
         self.device = self._init_device()
         torch_npu.npu.set_compile_mode(jit_compile=False)
+
+        self._set_dsv4_op_timeout()
+        self._prewarm_dsv4_hccl_groups()
 
         init_workspace_manager(self.device, num_ubatches=1)
 
         self.model_runner = NPUModelRunner310(self.vllm_config, self.device)
         logger.info_once("Using NPUWorker310 and NPUModelRunner310.")
+
+    def load_model(self) -> None:
+        super().load_model()
+        if self._uses_eager_dsv4_experts():
+            # Eager conversion replaces every packed MXFP4 Parameter storage.
+            # Release the now-unreferenced packed buffers from the caching
+            # allocator before KV cache allocation and the first request.
+            gc.collect()
+            torch.npu.empty_cache()
+            free_memory, _ = torch.npu.mem_get_info()
+            logger.info_once(
+                "Released stale packed-expert allocator blocks after eager W8A8 conversion; "
+                "%.2f GiB device memory is free.",
+                free_memory / GiB_bytes,
+                scope="local",
+            )
 
     def save_sharded_state(
         self,
@@ -70,6 +138,15 @@ class NPUWorker310(NPUWorker):
         bytes.
         """
         GiB = lambda b: b / GiB_bytes
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            self.available_kv_cache_memory_bytes = int(kv_cache_memory_bytes)
+            logger.info_once(
+                "Using %.2f GiB KV cache memory as explicitly configured; skipping 310P memory profiling.",
+                GiB(kv_cache_memory_bytes),
+                scope="local",
+            )
+            return int(kv_cache_memory_bytes)
+
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         with memory_profiling(

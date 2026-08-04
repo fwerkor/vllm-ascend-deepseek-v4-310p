@@ -89,8 +89,7 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
     def process_weights_after_loading(self, layer) -> None:
         if self.execution_mode == self._STREAMING_MODE:
             logger.info_once(
-                "Keeping local DeepSeek V4 expert shards packed for 310P streaming W8A8: "
-                "w13=%s, w2=%s, experts=%d.",
+                "Keeping local DeepSeek V4 expert shards packed for 310P streaming W8A8: w13=%s, w2=%s, experts=%d.",
                 tuple(layer.w13_weight.shape),
                 tuple(layer.w2_weight.shape),
                 layer.w13_weight.shape[0],
@@ -98,8 +97,7 @@ class AscendMXFP4ToW8A8DynamicFusedMoEMethod310(AscendW8A8DynamicFusedMoEMethod3
             return
 
         logger.info_once(
-            "Eagerly converting local DeepSeek V4 MXFP4 expert shard to 310P W8A8: "
-            "w13=%s, w2=%s, experts=%d.",
+            "Eagerly converting local DeepSeek V4 MXFP4 expert shard to 310P W8A8: w13=%s, w2=%s, experts=%d.",
             tuple(layer.w13_weight.shape),
             tuple(layer.w2_weight.shape),
             layer.w13_weight.shape[0],

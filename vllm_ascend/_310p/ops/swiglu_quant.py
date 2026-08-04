@@ -20,8 +20,7 @@ def swiglu_quant_310p(
         raise ValueError(f"Gate/up width must be even, got {gate_up.shape[-1]}.")
     if glu_alpha != 1.0 or glu_bias != 0.0:
         raise NotImplementedError(
-            "The 310P composed SwiGLU path currently supports only "
-            "glu_alpha=1.0 and glu_bias=0.0."
+            "The 310P composed SwiGLU path currently supports only glu_alpha=1.0 and glu_bias=0.0."
         )
 
     gate, up = gate_up.chunk(2, dim=-1)

@@ -17,6 +17,7 @@
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 import torch_npu
 
 from vllm_ascend.ops.fused_moe.experts_selector import _native_select_experts, _renormalize_topk_weights
@@ -35,6 +36,8 @@ def select_experts(
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
     global_num_experts: int = -1,
+    input_ids: torch.Tensor | None = None,
+    tid2eid: torch.Tensor | None = None,
 ):
     """
     Fused experts with select experts.
@@ -57,6 +60,35 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
+    if tid2eid is not None:
+        if input_ids is None:
+            raise ValueError("Hash-routed MoE requires current input_ids.")
+        token_ids = input_ids.reshape(-1).to(torch.int64)
+        if token_ids.numel() != router_logits.shape[0]:
+            raise ValueError(
+                f"Hash-routed input_ids and router rows differ: {token_ids.numel()} vs {router_logits.shape[0]}."
+            )
+        token_ids = torch.where(token_ids < 0, torch.zeros_like(token_ids), token_ids)
+        topk_ids = tid2eid.index_select(0, token_ids).to(torch.int32)
+        if topk_ids.shape[-1] != top_k:
+            raise ValueError(f"Hash table returns {topk_ids.shape[-1]} experts, expected top_k={top_k}.")
+
+        # DeepSeek V4 hash layers use the token table only for expert IDs.
+        # Routing weights still come from the unbiased router scores.
+        if scoring_func == "softmax":
+            scores = router_logits.softmax(dim=-1)
+        elif scoring_func == "sigmoid":
+            scores = router_logits.sigmoid()
+        elif scoring_func == "sqrtsoftplus":
+            scores = F.softplus(router_logits).sqrt()
+        else:
+            raise ValueError(f"Unsupported scoring function: {scoring_func}")
+        topk_weights = scores.gather(1, topk_ids.to(torch.int64))
+        topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+        return topk_weights.to(hidden_states.dtype), topk_ids
+
     if scoring_func == "softmax" and not use_grouped_topk and custom_routing_function is None:
         # 310P returns invalid routing results when this op receives more than 1024 tokens.
         if router_logits.shape[0] > 1024:

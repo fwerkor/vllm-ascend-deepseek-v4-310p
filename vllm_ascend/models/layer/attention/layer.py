@@ -109,7 +109,19 @@ class DSAAttention(nn.Module, AttentionLayerBase):
         # Initialize KV cache quantization attributes
         _init_kv_cache_quant(self, quant_config, prefix)
 
-        self.attn_backend = AscendDSABackend
+        # DeepSeek V4 historically hardcoded the generic DSA backend here,
+        # bypassing platform backend selection.  The 310P port needs its
+        # composed short-context implementation because the fused DSA custom
+        # operators are not available on this SoC/image.
+        from vllm_ascend._310p.deepseek_v4 import is_dsv4_310p_enabled
+        from vllm_ascend.utils import is_310p
+
+        if is_310p() and is_dsv4_310p_enabled():
+            from vllm_ascend._310p.attention.dsa_v1 import AscendDSABackend310
+
+            self.attn_backend = AscendDSABackend310
+        else:
+            self.attn_backend = AscendDSABackend
 
         # NOTE(zxr): vllm_is_batch_invariant is delete during updating to v0.20.1
         if (

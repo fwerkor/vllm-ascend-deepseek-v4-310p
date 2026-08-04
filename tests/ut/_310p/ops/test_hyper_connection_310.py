@@ -18,10 +18,7 @@ def _reference_sinkhorn(
     eps: float,
 ):
     pre = torch.sigmoid(mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
-    post = 2 * torch.sigmoid(
-        mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1]
-        + hc_base[hc_mult : 2 * hc_mult]
-    )
+    post = 2 * torch.sigmoid(mixes[..., hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult])
     comb = mixes[..., 2 * hc_mult :].reshape(*mixes.shape[:-1], hc_mult, hc_mult)
     comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].reshape(hc_mult, hc_mult)
     comb = comb.softmax(-1) + eps
@@ -68,5 +65,5 @@ def test_hc_pre_and_post_match_reference_shapes_and_values() -> None:
     out = hc_post_310p(branch, x, post, comb)
     out_ref = post.unsqueeze(-1) * branch.unsqueeze(-2)
     out_ref += (comb.unsqueeze(-1) * x.unsqueeze(-2)).sum(-3)
-    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(out, out_ref.to(out.dtype))
     assert out.shape == x.shape

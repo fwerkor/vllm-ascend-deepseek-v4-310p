@@ -33,6 +33,7 @@ _E2M1_VALUES = (
     -4.0,
     -6.0,
 )
+_E2M1_TABLE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
 def decode_e8m0(scale: torch.Tensor) -> torch.Tensor:
@@ -61,8 +62,17 @@ def unpack_mxfp4_groups(packed: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Expected 16 packed bytes per MXFP4 group, got shape {tuple(packed.shape)}.")
 
     packed_u8 = packed.view(torch.uint8)
-    codes = torch.cat((packed_u8 & 0x0F, packed_u8 >> 4), dim=-1)
-    table = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=packed.device)
+    low = packed_u8 & 0x0F
+    high = packed_u8 >> 4
+    # compressed-tensors packs consecutive FP4 values into each byte:
+    # value[2*i] in the low nibble and value[2*i+1] in the high nibble.
+    # Preserve that per-byte interleaving when expanding 16 bytes to 32 values.
+    codes = torch.stack((low, high), dim=-1).flatten(-2)
+    key = (packed.device.type, packed.device.index)
+    table = _E2M1_TABLE_CACHE.get(key)
+    if table is None:
+        table = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=packed.device)
+        _E2M1_TABLE_CACHE[key] = table
     return table[codes.to(torch.long)]
 
 

@@ -57,6 +57,7 @@ from vllm_ascend.spec_decode.utils import (
 )
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_NZ,
+    get_compressed_pos_and_indices,
     is_rc_device,
     lmhead_tp_enable,
 )
@@ -342,9 +343,18 @@ class NPUModelRunner310(NPUModelRunner):
             out=positions_np,
         )
         block_table = cast(MultiGroupBlockTable310, self.input_batch.block_table)
+        positions_compressed_list, req_indices_compressed_list, _ = get_compressed_pos_and_indices(
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            num_scheduled_tokens,
+            self.arange_np[:num_reqs],
+            self.use_compress,
+            self.kv_cache_config.kv_cache_groups,
+        )
         block_table.compute_slot_mapping(
             req_indices,
             positions_np[:total_num_scheduled_tokens],
+            positions_compressed_list=positions_compressed_list,
+            req_indices_compressed_list=req_indices_compressed_list,
         )
 
         if self.use_dcp:

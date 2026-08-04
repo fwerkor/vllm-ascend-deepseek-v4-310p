@@ -31,6 +31,7 @@ def _build_e4m3fn_table() -> tuple[float, ...]:
 
 
 _E4M3FN_VALUES = _build_e4m3fn_table()
+_E4M3FN_TABLE_CACHE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 
 def decode_e4m3fn(weight: torch.Tensor) -> torch.Tensor:
@@ -38,11 +39,15 @@ def decode_e4m3fn(weight: torch.Tensor) -> torch.Tensor:
     if weight.dtype != torch.float8_e4m3fn:
         raise TypeError(f"Expected float8_e4m3fn weight, got {weight.dtype}.")
     codes = weight.view(torch.uint8).to(torch.long)
-    table = torch.tensor(_E4M3FN_VALUES, dtype=torch.float32, device=weight.device)
-    decoded = table[codes]
-    if torch.isnan(decoded).any():
-        raise ValueError("DeepSeek FP8 weight contains an E4M3FN NaN code.")
-    return decoded
+    key = (weight.device.type, weight.device.index)
+    table = _E4M3FN_TABLE_CACHE.get(key)
+    if table is None:
+        table = torch.tensor(_E4M3FN_VALUES, dtype=torch.float32, device=weight.device)
+        _E4M3FN_TABLE_CACHE[key] = table
+    # The checkpoint is trusted and validated by safetensors. Avoid a per-chunk
+    # ``isnan().any()`` host synchronization, which can trip the 310P AICPU
+    # timeout after a long queued conversion sequence.
+    return table[codes]
 
 
 def requantize_block_fp8_to_int8(
@@ -64,9 +69,7 @@ def requantize_block_fp8_to_int8(
     block_rows, block_cols = block_shape
     expected_scale_shape = (cdiv(output_size, block_rows), cdiv(input_size, block_cols))
     if tuple(block_scale.shape) != expected_scale_shape:
-        raise ValueError(
-            f"Expected FP8 block scale shape {expected_scale_shape}, got {tuple(block_scale.shape)}."
-        )
+        raise ValueError(f"Expected FP8 block scale shape {expected_scale_shape}, got {tuple(block_scale.shape)}.")
 
     quantized = torch.empty((output_size, input_size), dtype=torch.int8, device=weight.device)
     row_scales = torch.empty((output_size,), dtype=torch.float32, device=weight.device)
@@ -123,9 +126,31 @@ class AscendFP8ToW8A8DynamicLinearMethod310(AscendW8A8DynamicLinearMethod):
         }
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight_data = layer.weight.data
+        scale_data = layer.weight_scale.data
+        singleton_input_major = weight_data.ndim == 3 and weight_data.shape[0] == 1
+        if singleton_input_major:
+            # DeepSeek V4 O-LoRA and related packed linears store a singleton
+            # shard as [1, input_size, output_size], while W8A8 conversion
+            # expects the canonical [output_size, input_size] matrix.
+            weight_data = weight_data.squeeze(0).transpose(0, 1).contiguous()
+            if scale_data.ndim == 3 and scale_data.shape[0] == 1:
+                scale_data = scale_data.squeeze(0)
+
+        if weight_data.ndim == 2 and scale_data.ndim == 2:
+            block_rows, block_cols = self.block_shape
+            expected_scale_shape = (
+                cdiv(weight_data.shape[0], block_rows),
+                cdiv(weight_data.shape[1], block_cols),
+            )
+            if tuple(scale_data.shape) == expected_scale_shape[::-1]:
+                # Packed DeepSeek V4 linears may store block scales in
+                # input-block-major order. Normalize to output-block-major.
+                scale_data = scale_data.transpose(0, 1).contiguous()
+
         weight, scale = requantize_block_fp8_to_int8(
-            layer.weight.data,
-            layer.weight_scale.data,
+            weight_data,
+            scale_data,
             block_shape=self.block_shape,
         )
         # Match the native 310P W8A8 orientation and NZ representation.

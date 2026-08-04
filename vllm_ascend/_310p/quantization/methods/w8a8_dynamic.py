@@ -22,6 +22,7 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
+from vllm.forward_context import get_forward_context
 
 from vllm_ascend._310p.fused_moe.experts_selector import select_experts
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -41,6 +42,9 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
     Notes:
       - This scheme is discovered via 310P local registry.
     """
+
+    # select_experts applies routed_scaling_factor before the expert MLP.
+    routed_output_includes_scale = True
 
     # Declare the quantization type for this scheme
     quant_type: QuantType = QuantType.W8A8
@@ -107,6 +111,8 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
 
+        input_ids = getattr(get_forward_context(), "input_ids", None)
+        routing_table = tid2eid if tid2eid is not None else getattr(self, "tid2eid", None)
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -120,6 +126,8 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
             routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=num_experts,
+            input_ids=input_ids,
+            tid2eid=routing_table,
         )
 
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -148,10 +156,14 @@ class AscendW8A8DynamicFusedMoEMethod310(AscendMoEScheme):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
+                activation=activation,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
+                swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
             ),
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
-            final_hidden_states += zero_expert_result
+            final_hidden_states.routed_out += zero_expert_result
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):

@@ -300,22 +300,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                             output_dtype=torch.int32,
                         )
                         maybe_wait_event(fused_moe_evts.before_gmm2)
-                        quantized_x, swiglu_out_scale = (
-                            torch.ops._C_ascend.npu_dequant_swiglu_quant(
-                                x=hidden_states,
-                                weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
-                                activation_scale=pertoken_scale,
-                                bias=None,
-                                quant_scale=None,
-                                quant_offset=None,
-                                group_index=None,
-                                activate_left=True,
-                                quant_mode=1,
-                                swiglu_mode=1,
-                                clamp_limit=fused_moe_evts.swiglu_limit,
-                                glu_alpha=fused_moe_evts.swiglu_alpha,
-                                glu_bias=fused_moe_evts.swiglu_beta,
-                            )
+                        quantized_x, swiglu_out_scale = torch.ops._C_ascend.npu_dequant_swiglu_quant(
+                            x=hidden_states,
+                            weight_scale=self._shared_experts.gate_up_proj.weight_scale_fp32,
+                            activation_scale=pertoken_scale,
+                            bias=None,
+                            quant_scale=None,
+                            quant_offset=None,
+                            group_index=None,
+                            activate_left=True,
+                            quant_mode=1,
+                            swiglu_mode=1,
+                            clamp_limit=fused_moe_evts.swiglu_limit,
+                            glu_alpha=fused_moe_evts.swiglu_alpha,
+                            glu_bias=fused_moe_evts.swiglu_beta,
                         )
                 else:
                     hidden_states = torch_npu.npu_quant_matmul(
@@ -429,7 +427,6 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             return_with_event=True,
         )
         routed_out = fused_moe_results.routed_out
-
         if self._shared_experts is None:
             return routed_out
 
