@@ -122,7 +122,7 @@ The broad regression command used for this path covers all 310P unit tests plus
 DSpark proposer, CPU binding, and dynamic W8A8 paths. The current result is:
 
 ```text
-261 passed, 3 skipped
+263 passed, 3 skipped
 ```
 
 The skipped cases require an NPU-enabled PyTorch build and are not executable in
@@ -142,8 +142,27 @@ arithmetic, sequence-completion, code-related, and repeated requests:
   tokens in 47.692 seconds, or 2.684 output tokens/s in aggregate;
 - target-only checks also reproduced identical top-5 log probabilities across
   six 8-token requests and identical outputs across three 32-token requests;
+- twelve consecutive DSpark requests with top-5 completion log probabilities
+  returned identical token IDs and log-probability vectors without changing
+  per-device memory usage;
+- a 20-request mixed API soak covered text completion, chat completion, top-5
+  log probabilities, seeded random sampling, and SSE streaming. Every request
+  completed with HTTP 200 and each fixed-seed case reproduced exactly;
+- four simultaneous requests were safely queued with one running and three
+  waiting, and all four returned identical output tokens;
+- a 120-token prompt plus eight generated tokens completed at the configured
+  128-token limit, while a 129-token request was rejected with HTTP 400;
+- completion and prompt log probabilities, tokenization, detokenization, and
+  unknown-model error handling were validated through the OpenAI-compatible API;
 - health remained HTTP 200 and the logs contained no AICore exception,
   out-of-range access, NaN, worker failure, or engine shutdown.
+
+The 310P speculative log-probability path avoids dynamic AICPU index operators.
+Placeholder token IDs are replaced with `torch.where`; raw-logprob mode reuses
+the flattened target logits directly, and processed-logprob mode uses
+out-of-place `index_copy`. This prevents the `NonzeroV2` and `IndexPutV3`
+allocation failures observed with indexed assignments on memory-constrained
+310P ranks.
 
 Without deterministic execution, near-tied logits could choose different greedy
 tokens across identical requests and consequently change DSpark acceptance.
@@ -164,7 +183,8 @@ the reported throughput.
   has not been qualified for long-context serving.
 - The validated 128 MiB KV-cache allocation provides 203 tokens of capacity and
   approximately 1.59x theoretical concurrency at a 128-token request length;
-  production concurrency has not been qualified.
+  queued requests have been validated, but simultaneous model execution is
+  disabled by the current `max_num_seqs=1` configuration.
 - Full TP8/EP8 target and draft loading takes about eight minutes. Each rank holds
   approximately 37.8 GiB of model weights, leaving about 2.3 GiB free after
   startup cleanup on the validated server.
@@ -173,5 +193,9 @@ the reported throughput.
   acceptance path reproducible for an identical request.
 - The current path uses eager execution. Tuned AscendC attention, grouped-matmul,
   and graph-mode kernels are still required for production performance.
-- Prefix caching, KV transfer, disaggregated serving, multi-request concurrency,
-  and contexts longer than 128 tokens have not been validated on this path.
+- The DeepSeek V4 tool-call template does not fit together with a generated tool
+  response inside the current 128-token limit; tool calling requires a larger
+  validated context budget.
+- Prefix caching, KV transfer, disaggregated serving, simultaneous multi-request
+  execution, and contexts longer than 128 tokens have not been validated on this
+  path.
