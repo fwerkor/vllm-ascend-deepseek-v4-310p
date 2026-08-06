@@ -472,7 +472,16 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
 
                         param = params_dict[name]
                         weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                        weight_loader(param, loaded_weight)
+                        try:
+                            weight_loader(param, loaded_weight)
+                        except AssertionError as exc:
+                            raise AssertionError(
+                                "Failed to load DeepSeek V4 MTP weight "
+                                f"{name!r}: parameter shape={tuple(param.shape)}, "
+                                f"checkpoint shape={tuple(loaded_weight.shape)}, "
+                                f"parameter dtype={param.dtype}, "
+                                f"checkpoint dtype={loaded_weight.dtype}."
+                            ) from exc
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
         return loaded_params

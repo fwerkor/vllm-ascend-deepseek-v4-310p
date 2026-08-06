@@ -54,11 +54,13 @@ def register_connector():
 def register_model_loader():
     _ensure_global_patch()
 
+    from ._310p.sharded_state_loader_310p import register_dsv4_w8a8_loader
     from .model_loader.netloader import register_netloader
     from .model_loader.rfork import register_rforkloader
 
     register_netloader()
     register_rforkloader()
+    register_dsv4_w8a8_loader()
 
 
 def register_service_profiling():

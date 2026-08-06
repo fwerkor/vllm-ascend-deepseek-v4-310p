@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import torch
 
 from vllm_ascend._310p.quantization.methods.mxfp4_to_w8a8 import (
     decode_e8m0,
     requantize_mxfp4_to_int8,
     unpack_mxfp4_groups,
+)
+from vllm_ascend._310p.quantization.methods.w4a8_mxfp4 import (
+    _is_preconverted_w8a8_layout,
 )
 
 
@@ -53,6 +58,26 @@ def test_requantize_chunking_is_stable() -> None:
     q2, s2 = requantize_mxfp4_to_int8(packed, scales, rows_per_chunk=64)
     torch.testing.assert_close(q1, q2)
     torch.testing.assert_close(s1, s2)
+
+
+def test_preconverted_layout_detection_does_not_confuse_packed_int8_bytes() -> None:
+    # Safetensors may expose raw packed MXFP4 bytes as int8.  A global
+    # preconverted mode must not make this half-width layout look like W8A8.
+    packed = SimpleNamespace(
+        w13_weight=torch.empty((2, 8, 16), dtype=torch.int8),
+        w2_weight=torch.empty((2, 16, 4), dtype=torch.int8),
+        w13_weight_scale=torch.empty((2, 8, 1), dtype=torch.uint8),
+        w2_weight_scale=torch.empty((2, 16, 1), dtype=torch.uint8),
+    )
+    assert not _is_preconverted_w8a8_layout(packed)
+
+    converted = SimpleNamespace(
+        w13_weight=torch.empty((2, 8, 32), dtype=torch.int8),
+        w2_weight=torch.empty((2, 16, 8), dtype=torch.int8),
+        w13_weight_scale=torch.empty((2, 8), dtype=torch.float32),
+        w2_weight_scale=torch.empty((2, 16), dtype=torch.float32),
+    )
+    assert _is_preconverted_w8a8_layout(converted)
 
 
 def test_requantize_allocates_the_final_logical_shape() -> None:

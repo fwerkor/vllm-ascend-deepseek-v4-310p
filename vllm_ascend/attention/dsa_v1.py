@@ -384,6 +384,7 @@ def build_dspark_swa_indices(
     seq_lens: torch.Tensor,
     num_decode_tokens: int | None = None,
     index_width: int | None = None,
+    blocks_per_phys_block: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build DSpark non-causal visible slot ids for a paged SWA cache.
 
@@ -400,7 +401,13 @@ def build_dspark_swa_indices(
         )
     if query_start_loc is None or seq_lens is None:
         raise ValueError("DSpark SWA query_start_loc and seq_lens must both be provided")
+    if blocks_per_phys_block <= 0 or block_size % blocks_per_phys_block != 0:
+        raise ValueError(
+            "DSpark blocks_per_phys_block must be a positive divisor of block_size: "
+            f"factor={blocks_per_phys_block}, block_size={block_size}."
+        )
 
+    logical_block_size = block_size // blocks_per_phys_block
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     prefix_lens = seq_lens - query_lens
     start_pos = (prefix_lens - int(window_size)).clamp(min=0)
@@ -411,13 +418,15 @@ def build_dspark_swa_indices(
     cols = torch.arange(index_width, device=start_pos.device)
     col_mask = cols[None, :] < visible_lens[:, None]
     pos = start_pos[:, None] + cols[None, :]
-    block_nums = pos // block_size
+    block_nums = pos // logical_block_size
     # Clamp to valid block-table columns so gather never goes OOB on the
     # out-of-range columns (their results are discarded by col_mask anyway).
     safe_nums = block_nums.clamp(min=0, max=int(block_table.shape[1]) - 1)
-    block_offsets = pos % block_size
-    block_ids = torch.gather(block_table, 1, safe_nums)
-    slot_ids = (block_ids * block_size + block_offsets).to(torch.int32)
+    logical_block_offsets = pos % logical_block_size
+    logical_block_ids = torch.gather(block_table, 1, safe_nums)
+    physical_block_ids = logical_block_ids // blocks_per_phys_block
+    physical_offsets = (logical_block_ids % blocks_per_phys_block) * logical_block_size + logical_block_offsets
+    slot_ids = (physical_block_ids * block_size + physical_offsets).to(torch.int32)
     slot_ids = slot_ids.where(col_mask, torch.full_like(slot_ids, -1))
 
     per_token_slots = torch.repeat_interleave(slot_ids, query_lens, dim=0, output_size=num_decode_tokens).unsqueeze(1)
@@ -1355,6 +1364,17 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         block_table = common_attn_metadata.block_table_tensor
         if not common_attn_metadata.causal:
             assert num_decodes is not None
+            blocks_per_phys_block = 1
+            if get_ascend_device_type() == AscendDeviceType._310P:
+                from vllm_ascend._310p.attention.dense_dsa import (
+                    infer_blocks_per_phys_block_from_shape,
+                )
+
+                blocks_per_phys_block = infer_blocks_per_phys_block_from_shape(
+                    block_table[:num_decodes],
+                    self.block_size,
+                    self.vllm_config.model_config.max_model_len,
+                )
             dspark_swa_indices, _ = build_dspark_swa_indices(
                 block_table[:num_decodes],
                 self.speculative_config.num_speculative_tokens,
@@ -1363,6 +1383,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 query_start_loc[: num_decodes + 1],
                 seq_lens[:num_decodes],
                 num_decode_tokens,
+                blocks_per_phys_block=blocks_per_phys_block,
             )
             dspark_swa_indices = dspark_swa_indices[:num_decode_tokens_typed]
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)

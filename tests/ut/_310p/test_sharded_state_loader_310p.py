@@ -14,121 +14,136 @@
 # limitations under the License.
 
 import json
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import pytest
 import torch
+from safetensors.torch import load_file, save_file
+from vllm.config.load import LoadConfig
 
-from tests.ut.base import TestBase
-from vllm_ascend._310p.sharded_state_loader_310p import ShardedStateLoader310
-
-
-class MockQuantConfig:
-    """Mock quantization config for testing."""
-
-    def __init__(self, quant_type: str = "FLOAT"):
-        self.quant_description = {"model_quant_type": quant_type}
+from vllm_ascend._310p.sharded_state_loader_310p import (
+    DSV4_W8A8_LOAD_FORMAT,
+    DSV4_W8A8_MARKER,
+    ShardedStateLoader310,
+)
 
 
-class MockModel(torch.nn.Module):
-    """Mock model for testing."""
-
-    def __init__(self, quant_config=None, with_int_weights: bool = False):
+class TinyModel(torch.nn.Module):
+    def __init__(self, shape: tuple[int, ...] = (2, 3), dtype: torch.dtype = torch.float32):
         super().__init__()
-        self.quant_config = quant_config
-        self.with_int_weights = with_int_weights
-        if with_int_weights:
-            self.linear = torch.nn.Linear(10, 10)
-            self.linear.weight = torch.nn.Parameter(
-                torch.randint(-127, 127, (10, 10), dtype=torch.int8), requires_grad=False
-            )
-            self.linear.bias = torch.nn.Parameter(torch.zeros(10, dtype=torch.int32), requires_grad=False)
-        else:
-            self.linear = torch.nn.Linear(10, 10)
+        self.weight = torch.nn.Parameter(torch.zeros(shape, dtype=dtype), requires_grad=False)
+        self.register_buffer("counter", torch.zeros(1, dtype=torch.int32))
 
 
-class TestShardedStateLoader310(TestBase):
-    """Test cases for ShardedStateLoader310."""
+def _write_marker(path: Path, tensor_parallel_size: int = 1) -> None:
+    (path / DSV4_W8A8_MARKER).write_text(
+        json.dumps(
+            {
+                "format": DSV4_W8A8_LOAD_FORMAT,
+                "version": 1,
+                "tensor_parallel_size": tensor_parallel_size,
+            }
+        ),
+        encoding="utf-8",
+    )
 
-    @patch("vllm.model_executor.model_loader.ShardedStateLoader._filter_subtensors")
-    @patch("vllm.distributed.get_tensor_model_parallel_rank")
-    @patch("safetensors.torch.save_file")
-    def test_save_model_with_nd_format_310(self, mock_save_file, mock_get_rank, mock_filter):
-        """Test save_model with ND format tensors (no conversion needed)."""
-        mock_get_rank.return_value = 0
-        mock_filter.side_effect = lambda x: x
-        mock_tensor = MagicMock(spec=torch.Tensor)
 
-        model = MockModel()
-        with (
-            patch.object(model, "state_dict", return_value={"linear.weight": mock_tensor}),
-            tempfile.TemporaryDirectory() as tmpdir,
-        ):
-            ShardedStateLoader310.save_model(model, tmpdir)
+def _model_config(path: Path):
+    return SimpleNamespace(model=str(path), model_weights=None)
 
-            mock_save_file.assert_called_once()
 
-    @patch("vllm.model_executor.model_loader.ShardedStateLoader._filter_subtensors")
-    def test_generate_quant_description_float_model_310(self, mock_filter):
-        """Test generate_quant_description for float model."""
-        mock_filter.side_effect = lambda x: x
-        quant_config = MockQuantConfig(quant_type="FLOAT")
-        model = MockModel(quant_config=quant_config, with_int_weights=False)
+def test_save_model_streams_multiple_safetensor_parts(tmp_path: Path) -> None:
+    model = TinyModel(shape=(4, 4), dtype=torch.float32)
+    model.weight.data.copy_(torch.arange(16, dtype=torch.float32).reshape(4, 4))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ShardedStateLoader310.generate_quant_description(model, tmpdir, quant_config)
+    with patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=0):
+        ShardedStateLoader310.save_model(model, str(tmp_path), max_size=32)
 
-            json_path = Path(tmpdir) / "parameters_type_map.json"
-            self.assertTrue(json_path.exists())
+    parts = sorted(tmp_path.glob("model-rank-0-part-*.safetensors"))
+    assert len(parts) == 2
+    merged = {}
+    for part in parts:
+        merged.update(load_file(str(part)))
+    torch.testing.assert_close(merged["weight"], model.weight.cpu())
+    torch.testing.assert_close(merged["counter"], model.counter.cpu())
 
-            with open(json_path, encoding="utf-8") as f:
-                quant_description = json.load(f)
 
-            self.assertEqual(quant_description["model_quant_type"], "FLOAT")
-            self.assertEqual(quant_description["version"], "1.0.0")
-            self.assertIn("linear.weight", quant_description)
-            self.assertEqual(quant_description["linear.weight"], "FLOAT")
-            self.assertIn("linear.bias", quant_description)
-            self.assertEqual(quant_description["linear.bias"], "FLOAT")
+def test_load_weights_replaces_parameter_shape_and_dtype(tmp_path: Path) -> None:
+    _write_marker(tmp_path)
+    checkpoint_weight = torch.arange(12, dtype=torch.int8).reshape(3, 4)
+    save_file(
+        {"weight": checkpoint_weight, "counter": torch.tensor([7], dtype=torch.int32)},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+    model = TinyModel(shape=(2, 3), dtype=torch.float32)
+    loader = ShardedStateLoader310(LoadConfig(load_format=DSV4_W8A8_LOAD_FORMAT))
 
-    @patch("vllm.model_executor.model_loader.ShardedStateLoader._filter_subtensors")
-    def test_generate_quant_description_no_quant_config_310(self, mock_filter):
-        """When quant_config is None, treat model as FLOAT."""
-        mock_filter.side_effect = lambda x: x
-        model = MockModel(quant_config=None, with_int_weights=False)
+    with (
+        patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        loader.load_weights(model, _model_config(tmp_path))
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ShardedStateLoader310.generate_quant_description(model, tmpdir, None)
+    assert model.weight.shape == (3, 4)
+    assert model.weight.dtype == torch.int8
+    torch.testing.assert_close(model.weight.cpu(), checkpoint_weight)
+    assert model.counter.item() == 7
 
-            json_path = Path(tmpdir) / "parameters_type_map.json"
-            self.assertTrue(json_path.exists())
 
-            with open(json_path, encoding="utf-8") as f:
-                quant_description = json.load(f)
+def test_load_weights_skips_target_keys_unused_by_draft(tmp_path: Path) -> None:
+    _write_marker(tmp_path)
+    checkpoint_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    save_file(
+        {
+            "weight": checkpoint_weight,
+            "counter": torch.tensor([2], dtype=torch.int32),
+            "target_only.weight": torch.ones(8, dtype=torch.float32),
+        },
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+    model = TinyModel()
+    loader = ShardedStateLoader310(LoadConfig(load_format=DSV4_W8A8_LOAD_FORMAT))
 
-            self.assertEqual(quant_description["model_quant_type"], "FLOAT")
-            self.assertEqual(quant_description["linear.weight"], "FLOAT")
+    with (
+        patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=1),
+    ):
+        loader.load_weights(model, _model_config(tmp_path))
 
-    @patch("vllm.model_executor.model_loader.ShardedStateLoader._filter_subtensors")
-    def test_generate_quant_description_int_model_310(self, mock_filter):
-        """Test generate_quant_description for int8 quantized model."""
-        mock_filter.side_effect = lambda x: x
-        quant_config = MockQuantConfig(quant_type="W8A8")
-        model = MockModel(quant_config=quant_config, with_int_weights=True)
+    torch.testing.assert_close(model.weight.cpu(), checkpoint_weight)
+    assert model.counter.item() == 2
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            ShardedStateLoader310.generate_quant_description(model, tmpdir, quant_config)
 
-            json_path = Path(tmpdir) / "parameters_type_map.json"
-            self.assertTrue(json_path.exists())
+def test_load_weights_rejects_tensor_parallel_mismatch(tmp_path: Path) -> None:
+    _write_marker(tmp_path, tensor_parallel_size=8)
+    save_file(
+        {"weight": torch.zeros((2, 3)), "counter": torch.zeros(1, dtype=torch.int32)},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+    loader = ShardedStateLoader310(LoadConfig(load_format=DSV4_W8A8_LOAD_FORMAT))
 
-            with open(json_path, encoding="utf-8") as f:
-                quant_description = json.load(f)
+    with (
+        patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
+        pytest.raises(ValueError, match="tensor-parallel size mismatch"),
+    ):
+        loader.load_weights(TinyModel(), _model_config(tmp_path))
 
-            self.assertEqual(quant_description["model_quant_type"], "W8A8")
-            self.assertEqual(quant_description["version"], "1.0.0")
-            self.assertIn("linear.weight", quant_description)
-            self.assertEqual(quant_description["linear.weight"], "W8A8")
-            self.assertIn("linear.bias", quant_description)
-            self.assertEqual(quant_description["linear.bias"], "W8A8")
+
+def test_generate_quant_description_and_marker(tmp_path: Path) -> None:
+    model = TinyModel(shape=(2, 3), dtype=torch.int8)
+
+    with (
+        patch("vllm.distributed.get_tensor_model_parallel_rank", return_value=0),
+        patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=8),
+    ):
+        ShardedStateLoader310.generate_quant_description(model, str(tmp_path))
+
+    quant_description = json.loads((tmp_path / "parameters_type_map.json").read_text(encoding="utf-8"))
+    marker = json.loads((tmp_path / DSV4_W8A8_MARKER).read_text(encoding="utf-8"))
+    assert quant_description["model_quant_type"] == "W8A8_DYNAMIC"
+    assert quant_description["weight"] == "W8A8_DYNAMIC"
+    assert quant_description["counter"] == "W8A8_DYNAMIC"
+    assert marker["format"] == DSV4_W8A8_LOAD_FORMAT
+    assert marker["tensor_parallel_size"] == 8

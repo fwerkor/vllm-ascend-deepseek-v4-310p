@@ -34,9 +34,16 @@ from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
 class NPUWorker310(NPUWorker):
     _DSV4_EXPERT_MODE_ENV = "VLLM_ASCEND_DSV4_310P_EXPERT_MODE"
     _DSV4_EAGER_MODE = "eager_w8a8"
+    _DSV4_PRECONVERTED_MODE = "preconverted_w8a8"
+
+    def _dsv4_expert_mode(self) -> str | None:
+        return os.getenv(self._DSV4_EXPERT_MODE_ENV)
 
     def _uses_eager_dsv4_experts(self) -> bool:
-        return os.getenv(self._DSV4_EXPERT_MODE_ENV) == self._DSV4_EAGER_MODE
+        return self._dsv4_expert_mode() == self._DSV4_EAGER_MODE
+
+    def _uses_resident_dsv4_experts(self) -> bool:
+        return self._dsv4_expert_mode() in (self._DSV4_EAGER_MODE, self._DSV4_PRECONVERTED_MODE)
 
     def _set_dsv4_op_timeout(self) -> None:
         if not self._uses_eager_dsv4_experts():
@@ -60,7 +67,7 @@ class NPUWorker310(NPUWorker):
 
     def _prewarm_dsv4_hccl_groups(self) -> None:
         """Initialize lazy HCCL communicators before eager experts fill HBM."""
-        if not self._uses_eager_dsv4_experts():
+        if not self._uses_resident_dsv4_experts():
             return
 
         from vllm.distributed import get_ep_group, get_tp_group
@@ -93,8 +100,9 @@ class NPUWorker310(NPUWorker):
 
     def load_model(self) -> None:
         super().load_model()
-        if self._uses_eager_dsv4_experts():
-            # Eager conversion replaces every packed MXFP4 Parameter storage.
+        if self._uses_resident_dsv4_experts():
+            # Eager conversion or preconverted loading replaces the initial
+            # checkpoint-facing Parameter storage.
             # Release the now-unreferenced packed buffers from the caching
             # allocator before KV cache allocation and the first request.
             gc.collect()

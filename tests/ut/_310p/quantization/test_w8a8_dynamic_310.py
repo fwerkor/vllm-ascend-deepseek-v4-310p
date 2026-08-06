@@ -105,7 +105,8 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
 
         output = self.method.apply(layer, x, tp_rank=0)
 
-        mock_npu_dynamic_quantize.assert_called_with(x)
+        mock_npu_dynamic_quantize.assert_called_once()
+        torch.testing.assert_close(mock_npu_dynamic_quantize.call_args.args[0], x.reshape(-1, x.shape[-1]))
         mock_npu_quant_matmul.assert_called_once()
         (args, kwargs) = mock_npu_quant_matmul.call_args
 
@@ -120,6 +121,28 @@ class TestAscendW8A8DynamicLinearMethod310(TestBase):
         self.assertEqual(kwargs["output_dtype"], layer.params_dtype)
 
         self.assertTrue(torch.equal(output, expected_y_output))
+
+    @patch("torch_npu.npu_dynamic_quant", create=True)
+    @patch("torch_npu.npu_quant_matmul")
+    def test_apply_flattens_mtp_candidate_dimensions(self, mock_npu_quant_matmul, mock_npu_dynamic_quantize):
+        layer = MagicMock()
+        layer.weight = torch.randn(128, 256, dtype=torch.float16)
+        layer.weight_scale = torch.randn(128, dtype=torch.float32)
+
+        x = torch.randn(3, 4, 128, dtype=torch.float16)
+        flattened_x = x.reshape(12, 128)
+        quantized_x = torch.randint(-128, 127, flattened_x.shape, dtype=torch.int8)
+        pertoken_scale = torch.randn(12, 1, dtype=torch.float32)
+        mock_npu_dynamic_quantize.return_value = quantized_x, pertoken_scale
+        flattened_output = torch.randn(12, 256, dtype=torch.float16)
+        mock_npu_quant_matmul.return_value = flattened_output
+
+        output = self.method.apply(layer, x)
+
+        torch.testing.assert_close(mock_npu_dynamic_quantize.call_args.args[0], flattened_x)
+        self.assertEqual(mock_npu_quant_matmul.call_args.kwargs["pertoken_scale"].shape, (12,))
+        self.assertEqual(output.shape, (3, 4, 256))
+        torch.testing.assert_close(output, flattened_output.reshape(3, 4, 256))
 
     @patch("vllm_ascend.utils.is_310p", return_value=True)
     @patch("torch_npu.npu_format_cast")

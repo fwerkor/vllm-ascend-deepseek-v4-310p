@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
+from vllm.utils.math_utils import cdiv
 
 
 def _flatten_rope_cache(cache: torch.Tensor, num_tokens: int, rotary_dim: int) -> torch.Tensor:
@@ -80,17 +83,56 @@ def write_paged_swa_cache(
     if slot_mapping is None:
         raise ValueError("SWA slot_mapping is required for the 310P dense fallback")
     if slot_mapping.ndim == 2:
-        flat_slots = slot_mapping[:, 0].to(torch.int64) * block_size + slot_mapping[:, 1].to(torch.int64)
+        flat_slots = slot_mapping[:, 0].to(torch.int32) * block_size + slot_mapping[:, 1].to(torch.int32)
     elif slot_mapping.ndim == 1:
-        flat_slots = slot_mapping.to(torch.int64)
+        flat_slots = slot_mapping.to(torch.int32)
     else:
         raise ValueError(f"Unsupported SWA slot_mapping shape: {tuple(slot_mapping.shape)}")
 
-    valid = flat_slots >= 0
-    if not bool(valid.any()):
-        return
     flat_cache = cache.reshape(-1, cache.shape[-2], cache.shape[-1])
-    flat_cache.index_copy_(0, flat_slots[valid], kv[valid].to(cache.dtype))
+    capacity = flat_cache.shape[0]
+    valid = (flat_slots >= 0) & (flat_slots < capacity)
+
+    if os.getenv("VLLM_ASCEND_DSV4_310P_VALIDATE_SLOTS", "0") == "1":
+        invalid_real = (flat_slots >= 0) & (flat_slots >= capacity)
+        if bool(invalid_real.any().item()):
+            invalid_values = flat_slots[invalid_real].to("cpu").tolist()
+            all_values = flat_slots.to("cpu").tolist()
+            raise RuntimeError(
+                "DeepSeek V4 310P SWA slot mapping exceeds cache capacity: "
+                f"capacity={capacity}, invalid={invalid_values}, all={all_values}, "
+                f"cache_shape={tuple(cache.shape)}, kv_shape={tuple(kv.shape)}, "
+                f"block_size={block_size}"
+            )
+
+    # Boolean advanced indexing lowers to ``NonzeroV2``, which cannot be
+    # replayed inside an ACL graph on 310P. Keep the write at a fixed shape:
+    # invalid/padded rows target distinct scratch slots and write back the
+    # values already stored there. Sort invalid rows before valid rows so a
+    # real cache write wins if it happens to use one of the scratch slots.
+    num_rows = flat_slots.numel()
+    scratch_slots = torch.remainder(
+        capacity
+        - 1
+        - torch.arange(
+            num_rows,
+            device=flat_slots.device,
+            dtype=torch.int32,
+        ),
+        capacity,
+    )
+    safe_slots = torch.where(valid, flat_slots, scratch_slots)
+    current = flat_cache.index_select(0, safe_slots)
+    write_values = torch.where(
+        valid.reshape(-1, 1, 1),
+        kv.to(cache.dtype),
+        current,
+    )
+    # FP32 sort keys and INT32 gather indices stay on AI Core on 310P.
+    write_order = torch.argsort(valid.to(torch.float32)).to(torch.int32)
+    ordered_slots = safe_slots.index_select(0, write_order).to(torch.int64)
+    ordered_values = write_values.index_select(0, write_order)
+    flat_cache.index_copy_(0, ordered_slots, ordered_values)
 
 
 def infer_blocks_per_phys_block(
@@ -179,6 +221,30 @@ def infer_blocks_per_phys_block(
             f"block_size={block_size}, candidates={candidates}"
         )
     return candidates[0]
+
+
+def infer_blocks_per_phys_block_from_shape(
+    block_table: torch.Tensor,
+    block_size: int,
+    max_model_len: int,
+) -> int:
+    """Recover hybrid block geometry from the statically allocated table."""
+    if block_table.ndim == 0:
+        raise ValueError("block_table must have at least one dimension")
+    physical_blocks = cdiv(max_model_len, block_size)
+    table_width = int(block_table.shape[-1])
+    if physical_blocks <= 0 or table_width % physical_blocks != 0:
+        raise ValueError(
+            "Block-table width is inconsistent with the configured context: "
+            f"width={table_width}, max_model_len={max_model_len}, block_size={block_size}"
+        )
+    factor = table_width // physical_blocks
+    if factor <= 0 or block_size % factor != 0:
+        raise ValueError(
+            "Derived hybrid block factor must divide the physical block size, "
+            f"got factor={factor}, block_size={block_size}"
+        )
+    return factor
 
 
 def gather_paged_swa_cache(
@@ -309,3 +375,112 @@ def dense_causal_swa_attention(
             output[q_start + local_query_idx] = torch.matmul(probabilities.to(keys.dtype), keys).to(q.dtype)
 
     return output
+
+
+def dense_decode_swa_attention(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    block_size: int,
+    blocks_per_phys_block: int = 1,
+    window_size: int,
+    softmax_scale: float,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """Vectorized uniform decode attention for every active request.
+
+    Decode is the latency-critical path.  Keep sequence lengths, block-table
+    translation, masking, and attention entirely on the NPU instead of
+    synchronizing metadata to the host once per layer.  This supports ordinary
+    one-token decode and uniform speculative batches such as MTP with Q=2.
+    """
+    num_requests = seq_lens.numel()
+    if num_requests == 0 or q.shape[0] % num_requests != 0:
+        raise ValueError(
+            "Uniform decode requires an equal query count per request, "
+            f"got {q.shape[0]} queries and {num_requests} requests"
+        )
+    query_len = q.shape[0] // num_requests
+    if blocks_per_phys_block <= 0 or block_size % blocks_per_phys_block != 0:
+        raise ValueError(
+            "blocks_per_phys_block must be a positive divisor of block_size, "
+            f"got {blocks_per_phys_block} and {block_size}"
+        )
+
+    logical_block_size = block_size // blocks_per_phys_block
+    lengths = seq_lens.reshape(-1, 1, 1).to(device=q.device, dtype=torch.int64)
+    query_offsets = torch.arange(query_len, device=q.device, dtype=torch.int64).reshape(1, -1, 1)
+    visible_ends = lengths - query_len + query_offsets + 1
+    window_offsets = torch.arange(window_size, device=q.device, dtype=torch.int64).reshape(1, 1, -1)
+    positions = visible_ends - window_size + window_offsets
+    valid = positions >= 0
+    positions = positions.clamp_min(0)
+
+    logical_table_indices = torch.div(positions, logical_block_size, rounding_mode="floor")
+    table = block_table[:num_requests].to(device=q.device, dtype=torch.int64)
+    expanded_table = table.unsqueeze(1).expand(-1, query_len, -1)
+    logical_blocks = torch.gather(expanded_table, 2, logical_table_indices)
+    physical_blocks = torch.div(logical_blocks, blocks_per_phys_block, rounding_mode="floor")
+    offsets = torch.remainder(logical_blocks, blocks_per_phys_block) * logical_block_size + torch.remainder(
+        positions, logical_block_size
+    )
+    keys = cache[physical_blocks, offsets, 0]
+
+    queries = q.reshape(num_requests, query_len, q.shape[1], q.shape[2]).to(keys.dtype)
+    logits = torch.matmul(queries, keys.transpose(-1, -2)).to(torch.float32) * softmax_scale
+    logits = logits.masked_fill(~valid.unsqueeze(2), torch.finfo(logits.dtype).min)
+    sink_logits = sinks.to(torch.float32).reshape(1, 1, -1, 1).expand(num_requests, query_len, -1, -1)
+    probabilities = torch.softmax(torch.cat((logits, sink_logits), dim=-1), dim=-1)[..., :window_size]
+    return torch.matmul(probabilities.to(keys.dtype), keys).to(q.dtype).reshape_as(q)
+
+
+def dense_dspark_swa_attention(
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    dspark_swa_indices: torch.Tensor,
+    *,
+    softmax_scale: float,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate the non-causal DSpark query block from paged SWA slots.
+
+    DSpark predicts a whole block in parallel.  Unlike ordinary speculative
+    decode, every query in that block is trained to attend to the trailing
+    context *and all query K/V rows in the current block*.  The generic DSA
+    metadata builder materializes that exact visible set as flattened paged
+    cache slot ids in ``dspark_swa_indices``.
+
+    Invalid/padded entries are ``-1`` and are masked before softmax.  Keeping
+    this operation vectorized avoids host synchronization on the latency-
+    critical draft path.
+    """
+    if dspark_swa_indices.ndim == 3:
+        if dspark_swa_indices.shape[1] != 1:
+            raise ValueError(
+                f"DSpark SWA indices must have a singleton group dimension, got {tuple(dspark_swa_indices.shape)}"
+            )
+        slot_ids = dspark_swa_indices[:, 0]
+    elif dspark_swa_indices.ndim == 2:
+        slot_ids = dspark_swa_indices
+    else:
+        raise ValueError(
+            f"DSpark SWA indices must be [tokens, width] or [tokens, 1, width], got {tuple(dspark_swa_indices.shape)}"
+        )
+    if slot_ids.shape[0] != q.shape[0]:
+        raise ValueError(f"DSpark SWA index rows must match the query count, got {slot_ids.shape[0]} and {q.shape[0]}")
+
+    flat_cache = cache.reshape(-1, cache.shape[-2], cache.shape[-1])
+    slot_ids = slot_ids.to(device=q.device, dtype=torch.int64)
+    valid = (slot_ids >= 0) & (slot_ids < flat_cache.shape[0])
+    safe_slot_ids = slot_ids.clamp(min=0, max=flat_cache.shape[0] - 1)
+    keys = flat_cache.index_select(0, safe_slot_ids.reshape(-1))[:, 0]
+    keys = keys.reshape(slot_ids.shape[0], slot_ids.shape[1], cache.shape[-1])
+
+    queries = q.to(keys.dtype)
+    logits = torch.matmul(queries, keys.transpose(-1, -2)).to(torch.float32) * softmax_scale
+    logits = logits.masked_fill(~valid.unsqueeze(1), torch.finfo(logits.dtype).min)
+    sink_logits = sinks.to(torch.float32).reshape(1, -1, 1).expand(q.shape[0], -1, -1)
+    probabilities = torch.softmax(torch.cat((logits, sink_logits), dim=-1), dim=-1)[..., : keys.shape[1]]
+    return torch.matmul(probabilities.to(keys.dtype), keys).to(q.dtype)

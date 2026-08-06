@@ -128,6 +128,20 @@ class AscendFP8ToW8A8DynamicLinearMethod310(AscendW8A8DynamicLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_data = layer.weight.data
         scale_data = layer.weight_scale.data
+        if weight_data.dtype == torch.int8:
+            # A preconverted sharded checkpoint stores the already transposed
+            # W8A8 matrix in logical [input, output] order. Rebuild the 310P NZ
+            # view without decoding or requantizing the original FP8 weights.
+            if weight_data.ndim != 2:
+                raise ValueError(
+                    f"Preconverted DeepSeek V4 W8A8 linear weight must be 2-D, got {tuple(weight_data.shape)}."
+                )
+            canonical = weight_data.transpose(0, 1).contiguous()
+            layer.weight.data = maybe_trans_nz(canonical).transpose(0, 1)
+            scale = scale_data.flatten().to(torch.float32)
+            layer.weight_scale.data = scale
+            layer.weight_scale_fp32 = scale
+            return
         singleton_input_major = weight_data.ndim == 3 and weight_data.shape[0] == 1
         if singleton_input_major:
             # DeepSeek V4 O-LoRA and related packed linears store a singleton

@@ -220,6 +220,28 @@ class TestDeviceInfo(unittest.TestCase):
         self.assertEqual(affinity, expected)
 
     @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_parse_topo_affinity_expands_board_to_logical_chips(self, mock_execute_command):
+        device_info = object.__new__(DeviceInfo)
+        device_info.npu_map_info = {
+            "0": {"0": "0", "1": "1"},
+            "32": {"0": "2", "1": "3"},
+        }
+        mock_execute_command.return_value = (
+            "NPU0 X PHB 0-23\nNPU32 PHB X 0-23",
+            0,
+        )
+
+        self.assertEqual(
+            device_info.parse_topo_affinity(),
+            {
+                0: list(range(24)),
+                1: list(range(24)),
+                2: list(range(24)),
+                3: list(range(24)),
+            },
+        )
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
     def test_parse_topo_affinity_skips_affinity_header_and_non_npu_rows(self, mock_execute_command):
         device_info = object.__new__(DeviceInfo)
         mock_execute_command.return_value = (

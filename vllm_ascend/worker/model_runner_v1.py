@@ -17,8 +17,10 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import gc
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -3455,11 +3457,56 @@ class NPUModelRunner(GPUModelRunner):
                     self._has_sinks = True
                     break
             if self.drafter:
+                if os.getenv("VLLM_ASCEND_DSV4_310P_EXPERT_MODE") == "preconverted_w8a8":
+                    # The custom loader replaces FP8/MXFP4 checkpoint-facing
+                    # Parameters with resident W8A8 tensors. Reclaim the old
+                    # storages before constructing the MTP draft model; waiting
+                    # until NPUWorker.load_model returns is too late because the
+                    # target and draft otherwise overlap at peak HBM usage.
+                    gc.collect()
+                    torch.npu.empty_cache()
+                    free_memory, _ = torch.npu.mem_get_info()
+                    logger.info_once(
+                        "Released preconverted DeepSeek V4 target loading buffers "
+                        "before MTP draft initialization; %.2f GiB device memory is free.",
+                        free_memory / (1024**3),
+                        scope="local",
+                    )
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
-                with get_tp_context(self.drafter):
-                    self.drafter.load_model(self.model)
+                expert_mode_env = "VLLM_ASCEND_DSV4_310P_EXPERT_MODE"
+                target_expert_mode = os.getenv(expert_mode_env)
+                draft_load_config = getattr(
+                    self.vllm_config.speculative_config,
+                    "draft_load_config",
+                    None,
+                )
+                draft_load_format = getattr(draft_load_config, "load_format", None)
+                draft_uses_raw_checkpoint = (
+                    target_expert_mode == "preconverted_w8a8"
+                    and str(draft_load_format) != "dsv4_310p_w8a8"
+                )
+                if draft_uses_raw_checkpoint:
+                    # Quantization methods capture this mode while the draft
+                    # model is constructed. The target is already resident in
+                    # W8A8, while DSpark/MTP weights come from the original
+                    # FP8/MXFP4 checkpoint and must be converted once here.
+                    os.environ[expert_mode_env] = "eager_w8a8"
+                    logger.info_once(
+                        "Loading DeepSeek V4 draft weights from the raw checkpoint "
+                        "with eager 310P W8A8 conversion.",
+                        scope="local",
+                    )
+                try:
+                    with get_tp_context(self.drafter):
+                        self.drafter.load_model(self.model)
+                finally:
+                    if draft_uses_raw_checkpoint:
+                        if target_expert_mode is None:
+                            os.environ.pop(expert_mode_env, None)
+                        else:
+                            os.environ[expert_mode_env] = target_expert_mode
 
             pp_group = get_pp_group()
             should_configure_aux_hidden_states = (

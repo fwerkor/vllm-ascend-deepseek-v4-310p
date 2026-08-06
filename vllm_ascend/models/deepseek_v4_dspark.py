@@ -39,6 +39,7 @@ from vllm_ascend.models.deepseek_v4 import (
     DeepseekV4MoE,
 )
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.utils import is_310p
 
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.scale$")
 
@@ -56,6 +57,18 @@ def _apply_dsv4_rope(
     sin_t = sin[layer_name]
     if inverse:
         sin_t = -sin_t
+    if is_310p():
+        # ACLop npu_rotary_mul on 310P only supports the half-rotation
+        # layout, while DeepSeek V4 uses pairwise/interleaved RoPE. Reuse the
+        # exact tensor fallback already exercised by the target DSA path.
+        from vllm_ascend._310p.attention.dense_dsa import apply_interleaved_rope
+
+        return apply_interleaved_rope(
+            x,
+            cos_t,
+            sin_t,
+            x.shape[-1],
+        )
     return rotary_emb(x, cos_t, sin_t)
 
 
@@ -125,7 +138,10 @@ class DeepseekV4DSparkModel(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=None,
+            # The DeepSeek V4 checkpoint stores main_proj in block-FP8
+            # (weight + E8M0 scale). Keep it on the same 310P FP8->W8A8
+            # conversion path as the other draft linears.
+            quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, f"layers.{self.mtp_start_layer_idx}.main_proj"),
         )
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -196,6 +212,22 @@ class DeepseekV4DSparkModel(nn.Module):
         while isinstance(swa_kv_cache, (list, tuple)) and len(swa_kv_cache) == 1:
             swa_kv_cache = swa_kv_cache[0]
 
+        if is_310p():
+            # The generic DSpark path uses the vllm-ascend custom
+            # npu_scatter_nd_update_v2 op, which is not built in the 310P
+            # image. Reuse the graph-safe paged SWA writer exercised by the
+            # target DeepSeek V4 attention path. It accepts both flat slot
+            # ids and [block, offset] mappings.
+            from vllm_ascend._310p.attention.dense_dsa import write_paged_swa_cache
+
+            write_paged_swa_cache(
+                swa_kv_cache,
+                shared_kv,
+                slot_mapping,
+                swa_cache_layer.block_size,
+            )
+            return
+
         from vllm_ascend.device.device_op import DeviceOperator
 
         if slot_mapping.ndim == 1:
@@ -227,8 +259,7 @@ class DeepseekV4DSparkModel(nn.Module):
         residual = None
         for layer in self.layers.values():
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling=None)
-        head_hidden = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-        return head_hidden
+        return self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
@@ -270,8 +301,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        self.has_own_embed_tokens = vllm_config.quant_config is not None
-        self.has_own_lm_head = vllm_config.quant_config is not None
+        # DeepSeek V4 DSpark does not carry stage-local vocabulary weights.
+        # The checkpoint exposes only the target model's standalone
+        # ``embed.weight`` and ``head.weight`` tensors, matching the official
+        # implementation where every DSpark stage reuses Transformer.embed and
+        # Transformer.head. Mark them as shared regardless of target
+        # quantization so the proposer replaces these temporary modules with
+        # the already loaded target embedding and LM head.
+        self.has_own_embed_tokens = False
+        self.has_own_lm_head = False
         self.model = DeepseekV4DSparkModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -396,19 +434,31 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
                 suffix = expert_scale_suffix if _EXPERT_SCALE_RE.search(name) else ".weight_scale"
                 name = name.removesuffix(".scale") + suffix
 
-            # E8M0 expert scales must retain their raw exponent bytes.
+            # Keep E8M0 scales in their checkpoint dtype when the destination
+            # parameter is also float8_e8m0fnu. Converting the source to uint8
+            # before ``copy_`` performs a numerical uint8->float8 cast instead
+            # of a bit copy: exponent bytes 120..126 all round to code 134,
+            # which decodes as scale 128 and corrupts the expert W8A8 scales.
             if ".experts." in name:
-                if "weight_scale" in name and loaded_weight.dtype == torch.float8_e8m0fnu:
-                    loaded_weight = loaded_weight.view(torch.uint8)
                 for param_name, weight_name, expert_id, shard_id in expert_mapping:
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)
                     param = params_dict[name_mapped]
+                    weight_to_load = loaded_weight
+                    if (
+                        "weight_scale" in name_mapped
+                        and loaded_weight.dtype == torch.float8_e8m0fnu
+                        and param.dtype == torch.uint8
+                    ):
+                        # Some backends intentionally register raw E8M0 scale
+                        # storage as bytes. Only those destinations need a
+                        # bit-level float8 view conversion.
+                        weight_to_load = loaded_weight.view(torch.uint8)
                     weight_loader = typing.cast(typing.Callable[..., bool], param.weight_loader)
                     success = weight_loader(
                         param,
-                        loaded_weight,
+                        weight_to_load,
                         name_mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,
@@ -438,8 +488,34 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts):
                     loaded_params.add(name)
                     continue
                 param = params_dict[name]
+                if (
+                    name.endswith(".weight_scale")
+                    and param.ndim == 2
+                    and loaded_weight.ndim == 2
+                    and param.shape[0] == loaded_weight.shape[0]
+                    and loaded_weight.shape[1] == param.shape[1] * tp_size
+                ):
+                    # RowParallelLinear shards the input dimension. Its FP8
+                    # block-scale Parameter does not carry ``input_dim``, so
+                    # vLLM's generic weight_loader cannot infer this split.
+                    # Shard the scale's input-block dimension explicitly.
+                    shard_width = param.shape[1]
+                    loaded_weight = loaded_weight.narrow(
+                        1,
+                        tp_rank * shard_width,
+                        shard_width,
+                    )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                try:
+                    weight_loader(param, loaded_weight)
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "Failed to load DeepSeek V4 DSpark weight "
+                        f"{name!r}: parameter shape={tuple(param.shape)}, "
+                        f"checkpoint shape={tuple(loaded_weight.shape)}, "
+                        f"parameter dtype={param.dtype}, "
+                        f"checkpoint dtype={loaded_weight.dtype}."
+                    ) from exc
                 loaded_params.add(name)
 
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))

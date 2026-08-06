@@ -200,7 +200,15 @@ class DeviceInfo:
                     continue
                 last_part = parts[-1]
                 if self.is_cpu_list(last_part):
-                    affinity[int(npu_match.group(1))] = self.expand_cpu_list(last_part)
+                    npu_id = npu_match.group(1)
+                    cpus = self.expand_cpu_list(last_part)
+                    chip_map = getattr(self, "npu_map_info", {}).get(npu_id)
+                    if chip_map:
+                        for logic_id in chip_map.values():
+                            if logic_id.isdigit():
+                                affinity[int(logic_id)] = cpus
+                    else:
+                        affinity[int(npu_id)] = cpus
         return affinity
 
 

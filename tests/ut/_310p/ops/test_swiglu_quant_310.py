@@ -24,6 +24,7 @@ def test_swiglu_quant_matches_reference() -> None:
     with patch(
         "torch_npu.npu_dynamic_quant",
         return_value=(expected_quantized, expected_scale),
+        create=True,
     ) as dynamic_quant:
         quantized, scale = swiglu_quant_310p(gate_up, clamp_limit=10.0)
 

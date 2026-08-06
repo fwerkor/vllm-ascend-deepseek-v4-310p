@@ -1,3 +1,4 @@
+import unittest
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -37,21 +38,41 @@ class TestAscendW8A8DynamicLinearMethod(TestBase):
             self.assertEqual(params["weight_offset"].shape, (128, 1))
 
     @patch("torch_npu.npu_quant_matmul")
-    @patch("torch_npu.npu_dynamic_quant")
+    @patch("torch_npu.npu_dynamic_quant", create=True)
     def test_apply_3d_input_with_squeeze(self, mock_dyn_quant, mock_matmul):
         mock_dyn_quant.return_value = (
-            torch.randint(-128, 127, (32, 1, 128), dtype=torch.int8),
-            torch.randn(32, 1, dtype=torch.float32),
+            torch.randint(-128, 127, (32, 128), dtype=torch.int8),
+            torch.randn(32, dtype=torch.float32),
         )
-        mock_matmul.return_value = torch.randn(32, 1, 256)
+        mock_matmul.return_value = torch.randn(32, 256)
         layer = MagicMock()
         layer.weight = torch.randint(-128, 127, (128, 256), dtype=torch.int8)
         layer.weight_scale = torch.randn(256, dtype=torch.float32)
         x = torch.randn(32, 1, 128, dtype=torch.bfloat16)
         output = self.method.apply(layer, x)
         mock_dyn_quant.assert_called_once()
+        torch.testing.assert_close(mock_dyn_quant.call_args.args[0], x.reshape(32, 128))
         mock_matmul.assert_called_once()
-        self.assertEqual(output.shape, (32, 1, 1, 256))
+        self.assertEqual(output.shape, (32, 1, 256))
+
+    @patch("torch_npu.npu_quant_matmul")
+    @patch("torch_npu.npu_dynamic_quant", create=True)
+    def test_apply_mtp_candidate_dimension(self, mock_dyn_quant, mock_matmul):
+        x = torch.randn(8, 4, 128, dtype=torch.bfloat16)
+        mock_dyn_quant.return_value = (
+            torch.randint(-128, 127, (32, 128), dtype=torch.int8),
+            torch.randn(32, 1, dtype=torch.float32),
+        )
+        mock_matmul.return_value = torch.randn(32, 256)
+        layer = MagicMock()
+        layer.weight = torch.randint(-128, 127, (128, 256), dtype=torch.int8)
+        layer.weight_scale = torch.randn(256, dtype=torch.float32)
+
+        output = self.method.apply(layer, x)
+
+        torch.testing.assert_close(mock_dyn_quant.call_args.args[0], x.reshape(32, 128))
+        self.assertEqual(mock_matmul.call_args.kwargs["pertoken_scale"].shape, (32,))
+        self.assertEqual(output.shape, (8, 4, 256))
 
     def test_process_weights_after_loading(self):
         layer = MagicMock()
@@ -66,6 +87,7 @@ class TestAscendW8A8DynamicLinearMethod(TestBase):
         self.assertEqual(layer.weight.data.shape, (256, 128))
 
 
+@unittest.skipUnless(hasattr(torch.Tensor, "npu"), "requires an NPU-enabled PyTorch build")
 class TestAscendW8A8DynamicLinearMethodWithNpu(TestBase):
     def setUp(self):
         self.method = AscendW8A8DynamicLinearMethod()

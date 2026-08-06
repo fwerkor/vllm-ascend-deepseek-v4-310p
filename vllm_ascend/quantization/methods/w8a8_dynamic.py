@@ -78,18 +78,16 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=self.act_quant_type)
-        need_unsqz = False
-        if pertoken_scale.dim() == 2:
-            need_unsqz = True
-            quantized_x = quantized_x.squeeze(dim=1)
-            pertoken_scale = pertoken_scale.squeeze(dim=1)
+        input_shape = x.shape
+        flattened_x = x.reshape(-1, input_shape[-1])
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(flattened_x, dst_type=self.act_quant_type)
+        pertoken_scale = pertoken_scale.reshape(-1)
 
         chunk_size = getattr(layer, "_chunk_size", 0)
         if isinstance(chunk_size, int) and chunk_size > 0:
             bias_1 = bias[:chunk_size] if bias is not None else None
             bias_2 = bias[chunk_size:] if bias is not None else None
-            output = torch.cat(
+            flattened_output = torch.cat(
                 [
                     torch_npu.npu_quant_matmul(
                         quantized_x,
@@ -111,7 +109,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
                 dim=-1,
             )
         else:
-            output = torch_npu.npu_quant_matmul(
+            flattened_output = torch_npu.npu_quant_matmul(
                 quantized_x,
                 layer.weight,
                 layer.weight_scale,
@@ -119,9 +117,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
                 bias=bias if self.act_quant_type == torch.int8 else None,
                 output_dtype=x.dtype,
             )
-        if need_unsqz:
-            output = output.unsqueeze(dim=1)
-        return output
+        return flattened_output.reshape(*input_shape[:-1], flattened_output.shape[-1])
 
     def process_weights_after_loading(self, layer):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()

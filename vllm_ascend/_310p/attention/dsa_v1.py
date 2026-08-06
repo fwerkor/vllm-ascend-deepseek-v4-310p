@@ -17,7 +17,10 @@ from .dense_dsa import (
     apply_interleaved_rope,
     dense_causal_current_attention,
     dense_causal_swa_attention,
+    dense_decode_swa_attention,
+    dense_dspark_swa_attention,
     infer_blocks_per_phys_block,
+    infer_blocks_per_phys_block_from_shape,
     normalize_swa_cache,
     write_paged_swa_cache,
 )
@@ -35,12 +38,12 @@ class AscendDSAImpl310(AscendDSAImpl):
         )
         super().__init__(*args, **kwargs)
         self._blocks_per_phys_block: int | None = None
-        max_model_len = self.vllm_config.model_config.max_model_len
-        if max_model_len > self.window_size:
+        self._max_model_len = self.vllm_config.model_config.max_model_len
+        if self._max_model_len > self.window_size:
             raise ValueError(
                 "The Ascend 310P dense DeepSeek V4 fallback is exact only while "
                 "max_model_len does not exceed sliding_window, got "
-                f"{max_model_len} and {self.window_size}."
+                f"{self._max_model_len} and {self.window_size}."
             )
 
     def _project_q_kv(
@@ -69,18 +72,27 @@ class AscendDSAImpl310(AscendDSAImpl):
         hidden_states: torch.Tensor,
         swa_cache: torch.Tensor,
         metadata,
+        *,
+        decode: bool = False,
     ) -> torch.Tensor:
         cos = metadata.cos[layer_name]
         sin = metadata.sin[layer_name]
         q, kv = self._project_q_kv(hidden_states, cos, sin)
         if self._blocks_per_phys_block is None:
-            self._blocks_per_phys_block = infer_blocks_per_phys_block(
-                metadata.block_table,
-                metadata.slot_mapping,
-                metadata.input_positions,
-                metadata.query_start_loc,
-                metadata.block_size,
-            )
+            try:
+                self._blocks_per_phys_block = infer_blocks_per_phys_block_from_shape(
+                    metadata.block_table,
+                    metadata.block_size,
+                    self._max_model_len,
+                )
+            except ValueError:
+                self._blocks_per_phys_block = infer_blocks_per_phys_block(
+                    metadata.block_table,
+                    metadata.slot_mapping,
+                    metadata.input_positions,
+                    metadata.query_start_loc,
+                    metadata.block_size,
+                )
         blocks_per_phys_block = self._blocks_per_phys_block
         write_paged_swa_cache(
             swa_cache,
@@ -90,18 +102,27 @@ class AscendDSAImpl310(AscendDSAImpl):
         )
         notify_kv_cache_written(layer_name)
         record_attention_compute_start()
-        query_lens = metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]
-        fresh_prefill = bool(torch.all(metadata.seq_lens == query_lens).item())
-        if fresh_prefill:
-            attention = dense_causal_current_attention(
+        if decode and metadata.dspark_swa_indices is not None:
+            attention = dense_dspark_swa_attention(
                 q,
-                kv,
-                metadata.query_start_loc,
+                swa_cache,
+                metadata.dspark_swa_indices,
+                softmax_scale=self.softmax_scale,
+                sinks=self.attn_sink,
+            )
+        elif decode and metadata.seq_lens.numel() > 0 and q.shape[0] % metadata.seq_lens.numel() == 0:
+            attention = dense_decode_swa_attention(
+                q,
+                swa_cache,
+                metadata.block_table,
+                metadata.seq_lens,
+                block_size=metadata.block_size,
+                blocks_per_phys_block=blocks_per_phys_block,
                 window_size=self.window_size,
                 softmax_scale=self.softmax_scale,
                 sinks=self.attn_sink,
             )
-        else:
+        elif decode:
             attention = dense_causal_swa_attention(
                 q,
                 swa_cache,
@@ -114,6 +135,31 @@ class AscendDSAImpl310(AscendDSAImpl):
                 softmax_scale=self.softmax_scale,
                 sinks=self.attn_sink,
             )
+        else:
+            query_lens = metadata.query_start_loc[1:] - metadata.query_start_loc[:-1]
+            fresh_prefill = bool(torch.all(metadata.seq_lens == query_lens).item())
+            if fresh_prefill:
+                attention = dense_causal_current_attention(
+                    q,
+                    kv,
+                    metadata.query_start_loc,
+                    window_size=self.window_size,
+                    softmax_scale=self.softmax_scale,
+                    sinks=self.attn_sink,
+                )
+            else:
+                attention = dense_causal_swa_attention(
+                    q,
+                    swa_cache,
+                    metadata.block_table,
+                    metadata.seq_lens,
+                    metadata.query_start_loc,
+                    block_size=metadata.block_size,
+                    blocks_per_phys_block=blocks_per_phys_block,
+                    window_size=self.window_size,
+                    softmax_scale=self.softmax_scale,
+                    sinks=self.attn_sink,
+                )
         attention = apply_interleaved_rope(
             attention,
             cos,
@@ -211,6 +257,7 @@ class AscendDSAImpl310(AscendDSAImpl):
                 hidden_states[:decode_tokens],
                 swa_cache,
                 swa_metadata.decode,
+                decode=True,
             )
 
         self._forward_o_proj_310p(o_proj_input, output)
