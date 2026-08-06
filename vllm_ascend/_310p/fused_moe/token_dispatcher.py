@@ -48,18 +48,20 @@ def resolve_live_ep_rank_310() -> int:
 def remap_global_expert_ids_310(
     topk_ids: torch.Tensor,
     expert_map: torch.Tensor,
+    non_local_expert_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map global expert IDs to local slots for the 310P routing operator.
 
     The CANN 310P ``npu_moe_init_routing_v2`` implementation requires
     ``expert_num`` to be the local expert count and ignores
     ``active_expert_range`` when global IDs are supplied.  Non-local routes are
-    mapped to slot zero only to keep the fixed expanded shape; their combine
-    weights are masked to zero, so their computed values never contribute.
+    mapped to a trailing virtual expert.  Routing therefore keeps the fixed
+    expanded shape, while the grouped-matmul boundary can exclude the virtual
+    expert rows entirely. Their combine weights are also masked to zero.
     """
     mapped = expert_map[topk_ids]
     local_mask = mapped >= 0
-    local_ids = torch.where(local_mask, mapped, torch.zeros_like(mapped))
+    local_ids = torch.where(local_mask, mapped, torch.full_like(mapped, non_local_expert_id))
     return local_ids.to(topk_ids.dtype), local_mask
 
 
@@ -85,10 +87,16 @@ class TokenDispatcherWithAllGather310(TokenDispatcherWithAllGather):
             assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         if expert_map is not None:
-            routing_topk_ids, mask = remap_global_expert_ids_310(topk_ids, expert_map)
+            routing_topk_ids, mask = remap_global_expert_ids_310(
+                topk_ids,
+                expert_map,
+                self.num_experts_local,
+            )
             topk_weights = topk_weights * mask
+            routing_expert_num = self.num_experts_local + 1
         else:
             routing_topk_ids = topk_ids
+            routing_expert_num = self.num_experts_local
 
         assert hidden_states.shape[-1] % 16 == 0, (
             f"The last dim of hidden_states {hidden_states.shape[-1]} should be aligned with 16."
@@ -97,12 +105,18 @@ class TokenDispatcherWithAllGather310(TokenDispatcherWithAllGather):
             hidden_states,
             routing_topk_ids,
             active_num=num_tokens * self.top_k,
-            expert_num=self.num_experts_local,
+            expert_num=routing_expert_num,
             drop_pad_mode=0,
-            active_expert_range=[0, self.num_experts_local],
+            active_expert_range=[0, routing_expert_num],
             quant_mode=-1,
             row_idx_type=0,
         )
+        if expert_map is not None:
+            # The virtual expert is sorted after all physical local experts.
+            # Excluding its final cumulative boundary makes grouped matmul
+            # process only local routes; the existing inactive-row clearing
+            # keeps the fixed tail safe for token unpermutation.
+            expert_tokens = expert_tokens[: self.num_experts_local]
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 0  # `cumsum` mode
 
