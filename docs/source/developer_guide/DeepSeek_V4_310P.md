@@ -29,6 +29,7 @@ Enable the model-specific backend and select the preconverted target layout:
 ```bash
 export VLLM_ASCEND_ENABLE_DSV4_310P=1
 export VLLM_ASCEND_DSV4_310P_EXPERT_MODE=preconverted_w8a8
+export VLLM_ASCEND_DSV4_310P_DETERMINISTIC=1
 export VLLM_ASCEND_ENABLE_MLAPO=0
 export VLLM_ASCEND_ENABLE_FUSED_MC2=0
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -78,6 +79,12 @@ vllm serve /path/to/DeepSeek-V4-Flash-W8A8-310P \
 DSpark uses a five-token native draft block. Values below five are rejected
 because truncating that block produces incorrect output.
 
+`VLLM_ASCEND_DSV4_310P_DETERMINISTIC=1` enables deterministic HCCL and
+ACLNN execution before distributed communicators and model operators are
+created. This is recommended for greedy evaluation, reproducible DSpark
+acceptance, and regression testing. It remains opt-in at the backend level so
+other 310P workloads retain their existing execution policy.
+
 ## Implemented paths
 
 The 310P backend currently provides:
@@ -93,6 +100,7 @@ The 310P backend currently provides:
 - paged SWA cache writes without unavailable 310P custom operators;
 - physical/logical hybrid block-table decoding for paged KV cache;
 - DSpark draft embedding, LM-head, and index-buffer sharing;
+- opt-in deterministic HCCL and ACLNN initialization for reproducible decoding;
 - 310P-safe cache allocation, worker initialization, CPU affinity, and memory
   cleanup.
 
@@ -114,24 +122,35 @@ The broad regression command used for this path covers all 310P unit tests plus
 DSpark proposer, CPU binding, and dynamic W8A8 paths. The current result is:
 
 ```text
-259 passed, 3 skipped
+261 passed, 3 skipped
 ```
 
 The skipped cases require an NPU-enabled PyTorch build and are not executable in
 the CPU-only unit-test container.
 
-A real TP8/EP8 service was also validated with greedy English, arithmetic,
-sequence-completion, code-related, and repeated sequential requests:
+A real TP8/EP8 deterministic service was validated with greedy English,
+arithmetic, sequence-completion, code-related, and repeated requests:
 
-- eight consecutive 16-token requests completed successfully;
-- 128 output tokens completed in 47.266 seconds in that sequential run, or
-  2.708 output tokens/s in aggregate;
-- a separate 64-token request completed in 27.514 seconds, or 2.326 output
-  tokens/s;
-- the cumulative DSpark draft acceptance observed after the validation requests
-  was 129 accepted tokens out of 395 drafted tokens, or 32.7%;
+- six identical 32-token DSpark requests produced identical token IDs and the
+  same speculative path each time: 50 drafted and 25 accepted tokens;
+- two consecutive fixed three-prompt benchmarks produced identical outputs and
+  identical aggregate acceptance, 137 accepted tokens out of 285 drafted
+  tokens, or 48.07%;
+- those two 192-token benchmark rounds completed at 3.622 and 3.607 output
+  tokens/s respectively;
+- eight consecutive 16-token requests completed successfully, with 128 output
+  tokens in 47.692 seconds, or 2.684 output tokens/s in aggregate;
+- target-only checks also reproduced identical top-5 log probabilities across
+  six 8-token requests and identical outputs across three 32-token requests;
 - health remained HTTP 200 and the logs contained no AICore exception,
   out-of-range access, NaN, worker failure, or engine shutdown.
+
+Without deterministic execution, near-tied logits could choose different greedy
+tokens across identical requests and consequently change DSpark acceptance.
+The measured top-two log-probability margins at the first divergence were only
+0.016 to 0.125. Enabling deterministic execution removed both token and
+acceptance-path variation without a measurable throughput penalty in this
+configuration.
 
 These figures are bring-up measurements for one short-context request at a time,
 not production service-level guarantees. Prompt lengths and cache state affect
@@ -146,12 +165,12 @@ the reported throughput.
 - The validated 128 MiB KV-cache allocation provides 203 tokens of capacity and
   approximately 1.59x theoretical concurrency at a 128-token request length;
   production concurrency has not been qualified.
-- Full TP8/EP8 target and draft loading takes about 7.5 minutes. Each rank holds
+- Full TP8/EP8 target and draft loading takes about eight minutes. Each rank holds
   approximately 37.8 GiB of model weights, leaving about 2.3 GiB free after
   startup cleanup on the validated server.
-- DSpark is functional and improves accepted-token throughput, but its acceptance
-  rate is workload-dependent and later positions in the five-token block are
-  accepted less frequently.
+- DSpark acceptance remains workload-dependent, and later positions in the
+  five-token block are accepted less frequently. Deterministic mode makes the
+  acceptance path reproducible for an identical request.
 - The current path uses eager execution. Tuned AscendC attention, grouped-matmul,
   and graph-mode kernels are still required for production performance.
 - Prefix caching, KV transfer, disaggregated serving, multi-request concurrency,

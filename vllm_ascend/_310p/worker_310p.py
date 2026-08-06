@@ -26,6 +26,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, memory_profiling
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 
+from vllm_ascend._310p.determinism import configure_dsv4_determinism
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
 from vllm_ascend.utils import is_rc_device
 from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
@@ -214,6 +215,7 @@ class NPUWorker310(NPUWorker):
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
+        configure_dsv4_determinism()
 
         # This lazy import avoids torch_npu re-initialization in patch
         # Note that this should be imported after torch.npu.set_device
