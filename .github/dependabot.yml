@@ -5,6 +5,8 @@ updates:
     schedule:
       # Check for updates to GitHub Actions every week
       interval: "weekly"
-    open-pull-requests-limit: 2
+    # This repository is a synchronized archival mirror of PR #13705.
+    # Keep upstream's config structure, but do not create mirror-only update PRs.
+    open-pull-requests-limit: 0
     reviewers:
       - "Yikun"
