@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+title: "DeepSeek-V4-Flash on Ascend 310P: vLLM Ascend Compatibility and Inference Support"
+message: "If you use this software, please cite the archived Zenodo release."
+type: software
+version: 0.1.0
+date-released: 2026-08-10
+license: Apache-2.0
+authors:
+  - family-names: Cao
+    given-names: Yuhang
+    affiliation: Nanjing University
+    email: caoyuhang@fwerkor.com
+    orcid: "https://orcid.org/0009-0004-0317-2729"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.21872941"
+repository-code: "https://github.com/fwerkor/vllm-ascend-deepseek-v4-310p"
+url: "https://doi.org/10.5281/zenodo.21872941"
+keywords:
+  - DeepSeek-V4
+  - DeepSeek-V4-Flash
+  - Ascend 310P
+  - Atlas 300I DUO
+  - vLLM Ascend
+  - NPU inference
+  - Mixture-of-Experts
+  - speculative decoding
+  - DSpark
+preferred-citation:
+  type: software
+  title: "DeepSeek-V4-Flash on Ascend 310P: vLLM Ascend Compatibility and Inference Support"
+  authors:
+    - family-names: Cao
+      given-names: Yuhang
+      affiliation: Nanjing University
+      orcid: "https://orcid.org/0009-0004-0317-2729"
+  doi: "10.5281/zenodo.21872941"
+  version: 0.1.0
+  year: 2026
